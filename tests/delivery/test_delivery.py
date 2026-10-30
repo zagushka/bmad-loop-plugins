@@ -161,15 +161,157 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(list(Path(self.cfg["state_dir"]).glob("*/job.json")), [])
 
     def test_branch_movement_at_pin_transaction_cannot_create_job_or_pin(self):
-        original = d.run
-        def run(args, *a, **kw):
+        original = d.subprocess.Popen
+        def popen(args, *a, **kw):
             if args == ["git", "update-ref", "--stdin"]:
-                original(["git", "commit", "--allow-empty", "-m", "concurrent advance"], self.repo)
+                d.git(self.repo, "commit", "--allow-empty", "-m", "concurrent advance")
             return original(args, *a, **kw)
-        with patch.object(d, "run", side_effect=run), self.assertRaisesRegex(RuntimeError, "cannot lock ref"):
+        with patch.object(d.subprocess, "Popen", side_effect=popen), self.assertRaisesRegex(RuntimeError, "cannot lock ref"):
             self.queued()
         self.assertEqual(d.git(self.repo, "for-each-ref", "refs/delivery/"), "")
         self.assertEqual(list(Path(self.cfg["state_dir"]).glob("*/job.json")), [])
+
+    def test_head_switch_or_detach_at_pin_transaction_is_atomic(self):
+        for linked in (False, True):
+            for action in ("switch", "detach"):
+                with self.subTest(linked=linked, action=action):
+                    case = DeliveryTest()
+                    case.setUp()
+                    try:
+                        source = case.repo
+                        if linked:
+                            source = case.root / "worktree"
+                            d.git(case.repo, "worktree", "add", "-b", "story", str(source), case.sha)
+                        before = (case.run_dir / "state.json").read_bytes()
+                        original = d.subprocess.Popen
+                        def popen(args, *a, **kw):
+                            if args == ["git", "update-ref", "--stdin"]:
+                                command = (["switch", "-c", "next-story"] if action == "switch"
+                                           else ["checkout", "--detach", case.sha])
+                                d.git(source, *command)
+                            return original(args, *a, **kw)
+                        with patch.object(d.subprocess, "Popen", side_effect=popen), self.assertRaises(d.Pending):
+                            d.enqueue(case.cfg, source, case.run_dir, "1.1")
+                        self.assertEqual(d.git(case.repo, "for-each-ref", "refs/delivery/"), "")
+                        self.assertEqual(list(Path(case.cfg["state_dir"]).glob("*/job.json")), [])
+                        self.assertEqual((case.run_dir / "state.json").read_bytes(), before)
+                    finally:
+                        case.doCleanups()
+
+    def test_unsupported_transaction_fails_without_job_or_pin(self):
+        for rejected in ("start", "prepare"):
+            with self.subTest(command=rejected):
+                case = DeliveryTest()
+                case.setUp()
+                try:
+                    original = d.subprocess.Popen
+                    def popen(args, *a, **kw):
+                        if args == ["git", "update-ref", "--stdin"]:
+                            code = ("import sys\nfor line in sys.stdin:\n"
+                                    f" if line.strip() == {rejected!r}:\n"
+                                    "  sys.stderr.write('fatal: unknown command: ' + line); sys.exit(128)\n"
+                                    " if line.strip() == 'start': print('start: ok', flush=True)\n")
+                            args = [d.sys.executable, "-c", code]
+                        return original(args, *a, **kw)
+                    with patch.object(d.subprocess, "Popen", side_effect=popen), self.assertRaisesRegex(RuntimeError, "unknown command"):
+                        case.queued()
+                    self.assertEqual(d.git(case.repo, "for-each-ref", "refs/delivery/"), "")
+                    self.assertEqual(list(Path(case.cfg["state_dir"]).glob("*/job.json")), [])
+                    case.queued()
+                finally:
+                    case.doCleanups()
+
+    def test_prepared_pin_locks_head_and_tip_until_identity_check(self):
+        for linked in (False, True):
+            with self.subTest(linked=linked):
+                case = DeliveryTest()
+                case.setUp()
+                try:
+                    source, branch = case.repo, "main"
+                    if linked:
+                        source, branch = case.root / "worktree", "story"
+                        d.git(case.repo, "worktree", "add", "-b", branch, str(source), case.sha)
+                    original = d.git
+                    checked = []
+                    def git(root, *args):
+                        if args == ("symbolic-ref", "--no-recurse", "--quiet", "HEAD"):
+                            for command in (("symbolic-ref", "HEAD", "refs/heads/other"),
+                                            ("update-ref", "refs/heads/" + branch, case.sha)):
+                                with self.assertRaisesRegex(RuntimeError, "lock"):
+                                    original(root, "-c", "core.filesRefLockTimeout=0", *command)
+                            if linked:
+                                original(case.repo, "symbolic-ref", "HEAD", "refs/heads/other-main")
+                            checked.append(True)
+                        return original(root, *args)
+                    with patch.object(d, "git", side_effect=git):
+                        key = d.enqueue(case.cfg, source, case.run_dir, "1.1")
+                    job = d.read(Path(case.cfg["state_dir"]) / key / "job.json")
+                    self.assertEqual(checked, [True])
+                    self.assertEqual(job["source_branch"], branch)
+                finally:
+                    case.doCleanups()
+
+    def test_prepared_pin_timeout_aborts_and_releases_locks(self):
+        with patch.object(d.concurrent.futures.Future, "result", side_effect=TimeoutError("controlled read timeout")):
+            with self.assertRaises(TimeoutError):
+                self.queued()
+        self.assertEqual(d.git(self.repo, "for-each-ref", "refs/delivery/"), "")
+        self.assertEqual(list(Path(self.cfg["state_dir"]).glob("*/job.json")), [])
+        # A retry must be able to acquire both Git locks after the abort.
+        self.queued()
+
+    def test_hung_transaction_hooks_release_locks_and_confirm_committed_pin(self):
+        for stage in ("prepared", "committed", "ignore-term"):
+            with self.subTest(stage=stage):
+                case = DeliveryTest()
+                case.setUp()
+                try:
+                    hook = case.repo / ".git/hooks/reference-transaction"
+                    pid_file = case.root / "hook.pid"
+                    if stage == "ignore-term":
+                        hook.write_text(f'#!/bin/sh\nif [ "$1" = "prepared" ]; then trap "" TERM; echo $$ > "{pid_file}"; sleep 60; fi\nexit 0\n')
+                    else:
+                        hook.write_text(f'#!/bin/sh\nif [ "$1" = "{stage}" ]; then echo $$ > "{pid_file}"; sleep 60; fi\nexit 0\n')
+                    hook.chmod(0o700)
+                    result = d.concurrent.futures.Future.result
+                    communicate = d.subprocess.Popen.communicate
+                    def wait_for_hook():
+                        deadline = d.time.monotonic() + 10
+                        while not pid_file.exists() and d.time.monotonic() < deadline:
+                            d.time.sleep(0.01)
+                        self.assertTrue(pid_file.exists(), "transaction hook did not start")
+                    def fast_result(future, timeout=None):
+                        if stage != "committed":
+                            wait_for_hook()
+                        return result(future, timeout=0.3 if stage != "committed" else 10)
+                    def fast_communicate(process, *a, **kw):
+                        if a == ("commit\n",):
+                            process.stdin.write(a[0])
+                            process.stdin.flush()
+                            wait_for_hook()
+                            a = ()
+                        return communicate(process, *a, **dict(kw, timeout=0.1))
+                    with patch.object(d.concurrent.futures.Future, "result", fast_result), patch.object(d.subprocess.Popen, "communicate", fast_communicate):
+                        if stage != "committed":
+                            with self.assertRaises(TimeoutError):
+                                case.queued()
+                        else:
+                            directory, job = case.queued()
+                            self.assertEqual(d.read(directory / "job.json")["sha"], case.sha)
+                            self.assertEqual(d.git(case.repo, "rev-parse", "refs/delivery/" + job["id"]), case.sha)
+                    self.assertEqual(list((case.repo / ".git").rglob("*.lock")), [])
+                    if stage == "ignore-term":
+                        pid = int(pid_file.read_text())
+                        # A killed hook can remain briefly as a zombie, but must not run.
+                        result = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+                        self.assertTrue(not result.stdout.strip() or result.stdout.strip().startswith("Z"), result.stdout)
+                    if stage != "committed":
+                        self.assertEqual(d.git(case.repo, "for-each-ref", "refs/delivery/"), "")
+                        self.assertEqual(list(Path(case.cfg["state_dir"]).glob("*/job.json")), [])
+                    hook.unlink()
+                    case.queued()
+                finally:
+                    case.doCleanups()
 
     def test_post_commit_captures_inplace_source_with_stale_saved_state(self):
         from types import SimpleNamespace
