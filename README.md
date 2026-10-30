@@ -4,7 +4,7 @@ An independent collection of versioned plugins for bmad-loop.
 
 | Plugin | Version | Purpose |
 | --- | --- | --- |
-| [delivery](docs/delivery/README.md) | 0.1.0 | Deliver exact source commits through checked GitHub PRs and record Ticket Tree acceptance using orchestrator evidence. |
+| [delivery](docs/delivery/README.md) | 0.1.1 | Deliver exact source commits through checked GitHub PRs and record Ticket Tree acceptance using orchestrator evidence. |
 | [codex-notify](docs/codex-notify/README.md) | 1.0.0 | Send advisory run/story journal notifications to one existing Codex chat per run. |
 
 Each plugin runtime is in `plugins/<name>/`. Tests, examples, compatibility metadata and documentation are outside that directory. Documentation edits do not change the installed runtime digest.
@@ -24,7 +24,7 @@ Clone this collection, then review its manager and the selected release:
 ```sh
 git clone https://github.com/zagushka/bmad-loop-plugins.git
 cd bmad-loop-plugins
-python3 -B manage.py install delivery --version 0.1.0 --project /absolute/project
+python3 -B manage.py install delivery --version 0.1.1 --project /absolute/project
 python3 -B manage.py status --project /absolute/project
 ```
 
