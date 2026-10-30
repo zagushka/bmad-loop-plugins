@@ -1,0 +1,15 @@
+[plugin]
+name = "delivery"
+version = "0.1.0"
+api_version = 1
+description = "Independent, exact-head GitHub delivery and Ticket Tree acceptance"
+
+[python]
+module = "delivery.py"
+class = "DeliveryPlugin"
+
+[[settings]]
+key = "config"
+type = "str"
+default = ""
+help = "Absolute path to operator-owned delivery JSON configuration; empty keeps delivery inert"

@@ -1,0 +1,12 @@
+{
+  "repository": "OWNER/REPOSITORY",
+  "base": "main",
+  "state_dir": "/absolute/private/delivery-state",
+  "orchestrators": ["authorized-delivery-orchestrator"],
+  "expected_checks": ["documented-ci-job-name"],
+  "command_timeout": 120,
+  "check_timeout": 1800,
+  "max_attempts": 20,
+  "poll_interval": 5,
+  "worker_lifetime": 3600
+}
