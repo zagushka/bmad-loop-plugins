@@ -115,9 +115,129 @@ class DeliveryTest(unittest.TestCase):
 
     def test_original_binding_survives_linked_worktree(self):
         worktree = self.root / "worktree"
-        d.git(self.repo, "worktree", "add", "--detach", str(worktree), self.sha)
+        d.git(self.repo, "worktree", "add", "-b", "isolated-story", str(worktree), self.sha)
         directory = d.enqueue(self.cfg, worktree, self.run_dir, "1.1", self.sha, "done")
-        self.assertEqual(d.read(Path(self.cfg["state_dir"]) / directory / "job.json")["plan"], "initiative/plan.md")
+        job = d.read(Path(self.cfg["state_dir"]) / directory / "job.json")
+        self.assertEqual(job["plan"], "initiative/plan.md")
+        self.assertEqual(job["source_branch"], "isolated-story")
+
+    def test_inplace_enqueue_captures_actual_branch_without_changing_run(self):
+        d.git(self.repo, "switch", "-c", "story")
+        self.state["tasks"]["1.1"].update(branch="", target_branch="main")
+        d.atomic(self.run_dir / "state.json", self.state)
+        before = (self.run_dir / "state.json").read_bytes()
+        _, job = self.queued()
+        self.assertEqual(job["source_branch"], "story")
+        self.assertEqual(job["sha"], self.sha)
+        self.assertEqual((self.run_dir / "state.json").read_bytes(), before)
+
+    def test_missing_branch_rejects_detached_or_mismatched_head_without_pin(self):
+        d.git(self.repo, "checkout", "--detach", self.sha)
+        with self.assertRaisesRegex(d.Pending, "attached HEAD"):
+            self.queued()
+        d.git(self.repo, "switch", "main")
+        d.git(self.repo, "commit", "--allow-empty", "-m", "advance source")
+        with self.assertRaisesRegex(d.Pending, "pinned commit"):
+            self.queued()
+        self.assertEqual(d.git(self.repo, "for-each-ref", "refs/delivery/"), "")
+        self.assertEqual(list(Path(self.cfg["state_dir"]).glob("*/job.json")), [])
+
+    def test_source_branch_is_not_ambiguous_with_same_named_tag(self):
+        d.git(self.repo, "switch", "-c", "story/nested")
+        d.git(self.repo, "tag", "story/nested")
+        _, job = self.queued()
+        self.assertEqual(job["source_branch"], "story/nested")
+
+    def test_branch_switch_during_capture_is_rejected_before_pin(self):
+        original = d.git
+        def git(root, *args):
+            value = original(root, *args)
+            if args == ("rev-parse", "HEAD"):
+                original(root, "switch", "-c", "next-story")
+            return value
+        with patch.object(d, "git", side_effect=git), self.assertRaisesRegex(d.Pending, "pinned commit"):
+            self.queued()
+        self.assertEqual(d.git(self.repo, "for-each-ref", "refs/delivery/"), "")
+        self.assertEqual(list(Path(self.cfg["state_dir"]).glob("*/job.json")), [])
+
+    def test_branch_movement_at_pin_transaction_cannot_create_job_or_pin(self):
+        original = d.run
+        def run(args, *a, **kw):
+            if args == ["git", "update-ref", "--stdin"]:
+                original(["git", "commit", "--allow-empty", "-m", "concurrent advance"], self.repo)
+            return original(args, *a, **kw)
+        with patch.object(d, "run", side_effect=run), self.assertRaisesRegex(RuntimeError, "cannot lock ref"):
+            self.queued()
+        self.assertEqual(d.git(self.repo, "for-each-ref", "refs/delivery/"), "")
+        self.assertEqual(list(Path(self.cfg["state_dir"]).glob("*/job.json")), [])
+
+    def test_post_commit_captures_inplace_source_with_stale_saved_state(self):
+        from types import SimpleNamespace
+        self.state["tasks"]["1.1"].update(branch="", phase="committing", commit_sha=None)
+        d.atomic(self.run_dir / "state.json", self.state)
+        before = (self.run_dir / "state.json").read_bytes()
+        cfg_path = self.root / "config.json"
+        d.atomic(cfg_path, self.cfg)
+        plugin = d.DeliveryPlugin(None, dict(config=str(cfg_path)))
+        ctx = SimpleNamespace(stage="post_commit", phase="done", worktree=None,
+                              repo_root=str(self.repo), run_dir=str(self.run_dir), story_key="1.1", shared={})
+        # Keep real Git Popen calls; intercept only the worker launch.
+        original = d.subprocess.Popen
+        launches = []
+        def popen(args, *a, **kw):
+            if args[0] == d.sys.executable:
+                launches.append(args)
+                return None
+            return original(args, *a, **kw)
+        with patch.object(d.subprocess, "Popen", side_effect=popen):
+            plugin.capture(ctx)
+        self.assertEqual(ctx.shared, {})
+        jobs = list(Path(self.cfg["state_dir"]).glob("*/job.json"))
+        self.assertEqual(len(jobs), 1)
+        job = d.read(jobs[0])
+        self.assertEqual((job["source_branch"], job["sha"]), ("main", self.sha))
+        self.assertEqual(len(launches), 1)
+        self.assertEqual((self.run_dir / "state.json").read_bytes(), before)
+        # A fresh run on detached HEAD must record an advisory failure only.
+        ctx.run_dir = str(self.root / "detached-run")
+        d.atomic(Path(ctx.run_dir) / "state.json", self.state)
+        d.git(self.repo, "checkout", "--detach", self.sha)
+        pins = d.git(self.repo, "for-each-ref", "refs/delivery/")
+        with patch.object(d.subprocess, "Popen", side_effect=popen):
+            plugin.capture(ctx)
+        self.assertIn("attached HEAD", ctx.shared["delivery_error"])
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(list(Path(self.cfg["state_dir"]).glob("*/job.json")), jobs)
+        self.assertEqual(d.git(self.repo, "for-each-ref", "refs/delivery/"), pins)
+        self.assertEqual((Path(ctx.run_dir) / "state.json").read_bytes(), before)
+
+    def test_missing_branch_rejects_foreign_repository_with_same_commit(self):
+        other = self.root / "other"
+        d.git(self.repo, "clone", str(self.repo), str(other))
+        with self.assertRaisesRegex(d.Pending, "run repository"):
+            d.enqueue(self.cfg, other, self.run_dir, "1.1")
+        self.assertEqual(d.git(other, "for-each-ref", "refs/delivery/"), "")
+        self.assertEqual(list(Path(self.cfg["state_dir"]).glob("*/job.json")), [])
+
+    def test_existing_job_is_unchanged_after_source_moves_or_detaches(self):
+        directory, job = self.queued()
+        # A legacy job must not acquire a branch during a repeated enqueue.
+        job["source_branch"] = ""
+        d.atomic(directory / "job.json", job)
+        before = (directory / "job.json").read_bytes()
+        d.git(self.repo, "commit", "--allow-empty", "-m", "next story")
+        for detached in (False, True):
+            if detached:
+                d.git(self.repo, "checkout", "--detach")
+            self.assertEqual(d.enqueue(self.cfg, self.repo, self.run_dir, "1.1"), job["id"])
+            self.assertEqual((directory / "job.json").read_bytes(), before)
+
+    def test_explicit_branch_remains_supported_with_detached_checkout(self):
+        self.state["tasks"]["1.1"]["branch"] = "isolated-story"
+        d.atomic(self.run_dir / "state.json", self.state)
+        d.git(self.repo, "checkout", "--detach", self.sha)
+        _, job = self.queued()
+        self.assertEqual(job["source_branch"], "isolated-story")
 
     def test_parked_and_hitl_do_not_enqueue(self):
         self.assertIsNone(d.enqueue(self.cfg, self.repo, self.run_dir, "1.1", phase="awaiting-operator"))
@@ -421,7 +541,7 @@ class DeliveryTest(unittest.TestCase):
         worker.native = native
         return prs, counts
 
-    def integration_fixture(self, multiple=False, transient=False, base_gate=False, child_fields="", child_baseline=False, child_crlf=False):
+    def integration_fixture(self, multiple=False, transient=False, base_gate=False, child_fields="", child_baseline=False, child_crlf=False, inplace=False, legacy_child=False):
         """Accept a child on integration through two real squash merge commits."""
         self.ticket_fixture(new_plan=not child_baseline)
         child_plan = self.repo / "initiative/tickets/epic-test/tickets/story-test-plan.md"
@@ -480,6 +600,9 @@ class DeliveryTest(unittest.TestCase):
         child_id = d.enqueue(child_cfg, self.repo, self.run_dir, "1.1")
         child_dir = Path(self.cfg["state_dir"]) / child_id
         child = d.read(child_dir / "job.json")
+        if legacy_child:
+            child["source_branch"] = ""
+            d.atomic(child_dir / "job.json", child)
         def evidence_for(job, criterion):
             contract_path = str(Path(job["plan"]).parent / "tickets.toml")
             artifacts = [dict(path=p, sha256=hashlib.sha256((self.repo / p).read_bytes()).hexdigest())
@@ -531,7 +654,7 @@ class DeliveryTest(unittest.TestCase):
         d.git(self.repo, "add", ".")
         d.git(self.repo, "commit", "-m", "build final delivery and plan unrelated work")
         final_ref = "2.1" if base_gate else "1.2"
-        self.state["tasks"][final_ref] = dict(phase="done", branch="integration", operator_actions=[],
+        self.state["tasks"][final_ref] = dict(phase="done", branch="" if inplace else "integration", target_branch="main", operator_actions=[],
             commit_sha=d.git(self.repo, "rev-parse", "HEAD"),
             ticket=dict(ref=final_ref, plan=str(plan), title="Final"))
         d.atomic(self.run_dir / "state.json", self.state)
@@ -545,7 +668,7 @@ class DeliveryTest(unittest.TestCase):
         return directory, job, worker, child, prs, counts
 
     def test_multiple_accepted_children_after_transient_retry(self):
-        directory, job, worker, child, prs, counts = self.integration_fixture(multiple=True, transient=True)
+        directory, job, worker, child, prs, counts = self.integration_fixture(multiple=True, transient=True, legacy_child=True)
         checkout = directory / "checkout"
         audit_path = str(Path(child["plan"]).parent / f"delivery-{child['id']}.json")
         audit = json.loads(d.git(checkout, "show", f"{job['sha']}:{audit_path}"))
@@ -672,7 +795,9 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(d.read(directory / "job.json"), before)
 
     def test_accepted_integration_child_final_delivery_and_restart(self):
-        directory, job, worker, child, prs, counts = self.integration_fixture()
+        directory, job, worker, child, prs, counts = self.integration_fixture(inplace=True)
+        self.assertEqual(job["source_branch"], "integration")
+        self.assertEqual(d.read(self.run_dir / "state.json")["tasks"]["1.2"]["branch"], "")
         checkout = directory / "checkout"
         base = worker.current_ticket(directory, job, job["sha"])
         self.assertEqual(base, d.git(self.remote, "rev-parse", "main"))
@@ -1062,7 +1187,7 @@ class DeliveryTest(unittest.TestCase):
                     case.sha = d.git(case.repo, "rev-parse", "HEAD")
                     worktree = case.root / "removed-worktree"
                     d.git(case.repo, "worktree", "add", "--detach", str(worktree), case.sha)
-                    case.state["tasks"]["1.1"]["commit_sha"] = case.sha
+                    case.state["tasks"]["1.1"].update(commit_sha=case.sha, branch="isolated-story")
                     d.atomic(case.run_dir / "state.json", case.state)
                     key = d.enqueue(case.cfg, worktree, case.run_dir, "1.1")
                     directory = Path(case.cfg["state_dir"]) / key

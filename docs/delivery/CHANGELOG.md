@@ -1,5 +1,9 @@
 # Delivery changelog
 
+## 0.1.2
+
+New jobs with no native task branch now capture the actual attached source branch at enqueue. The checkout must share the run repository and its HEAD and branch tip must equal the pinned commit. Detached, foreign or moved sources are refused before a job or pin is created. Explicit task branches retain their existing behavior. Repeated enqueue preserves existing job bytes and IDs; old jobs and runs are not migrated.
+
 ## 0.1.1
 
 Support direct integration-branch delivery to the final base when unresolved base-side `after` tickets have accepted code and tracking delivery in the exact pinned source. Each child needs one tracked audit, unchanged accepted plan and contract, exact-source review and check evidence, fresh GitHub merge receipts and merge ancestry. Multiple accepted children are supported. The final job must record its integration `source_branch`; no private job lookup or override is needed.
