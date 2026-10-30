@@ -166,6 +166,68 @@ def relative(root, path):
     return str(Path(path).resolve().relative_to(Path(root).resolve()))
 
 
+def pin_source(root, source_ref, sha, job_id):
+    env = {key: value for key, value in os.environ.items() if key not in GIT_LOCAL_ENV}
+    with tempfile.TemporaryFile() as errors, concurrent.futures.ThreadPoolExecutor(max_workers=1) as reader:
+        process = subprocess.Popen(["git", "update-ref", "--stdin"], cwd=root, env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
+            text=True, start_new_session=True)
+        commit_timeout = None
+        try:
+            process.stdin.write(f"start\nverify HEAD {sha}\nupdate refs/delivery/{job_id} {sha}\nprepare\n")
+            process.stdin.flush()
+            for expected in ("start: ok\n", "prepare: ok\n"):
+                if reader.submit(process.stdout.readline).result(timeout=120) != expected:
+                    errors.seek(0)
+                    raise RuntimeError("source pin transaction refused: " + errors.read().decode(errors="replace")[-3000:])
+            # Prepared verify HEAD holds both HEAD and its referent until commit or abort.
+            try:
+                attached = git(root, "symbolic-ref", "--no-recurse", "--quiet", "HEAD")
+            except RuntimeError as error:
+                raise Pending("source branch requires an attached HEAD") from error
+            if attached != source_ref:
+                raise Pending("source branch changed before pin transaction")
+            try:
+                output, _ = process.communicate("commit\n", timeout=120)
+            except subprocess.TimeoutExpired as error:
+                commit_timeout = error
+            else:
+                if process.returncode or output != "commit: ok\n":
+                    errors.seek(0)
+                    raise RuntimeError("source pin commit refused: " + errors.read().decode(errors="replace")[-3000:])
+        finally:
+            if process.poll() is None:
+                if not process.stdin.closed:
+                    try:
+                        process.stdin.write("abort\n")
+                        process.stdin.flush()
+                    except BrokenPipeError:
+                        pass
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    # A hook can ignore SIGTERM even after Git has cleaned up and exited.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+            with contextlib.suppress(BrokenPipeError):
+                process.stdin.close()
+            process.stdout.close()
+        if commit_timeout:
+            # A committed hook can time out after the verified pin is already durable.
+            try:
+                pinned = git(root, "rev-parse", "--verify", f"refs/delivery/{job_id}")
+            except RuntimeError:
+                pinned = None
+            if pinned != sha:
+                raise Pending("source pin commit outcome unconfirmed; preserve pin and Git locks for inspection") from commit_timeout
+
+
 def enqueue(cfg, root, run_dir, key, sha=None, phase=None):
     state = read(Path(run_dir) / "state.json")
     task = state["tasks"][key]
@@ -202,11 +264,7 @@ def enqueue(cfg, root, run_dir, key, sha=None, phase=None):
                         or git(root, "symbolic-ref", "--quiet", "HEAD") != source_ref):
                     raise Pending("source branch does not match pinned commit")
                 source_branch = source_ref.removeprefix("refs/heads/")
-                # Verify and pin in one transaction so a moved branch cannot pass capture.
-                with tempfile.TemporaryFile() as commands:
-                    commands.write(f"verify {source_ref} {sha}\nupdate refs/delivery/{job_id} {sha}\n".encode())
-                    commands.seek(0)
-                    run(["git", "update-ref", "--stdin"], root, stdin=commands)
+                pin_source(root, source_ref, sha, job_id)
             else:
                 git(root, "update-ref", f"refs/delivery/{job_id}", sha)
             settings = {}

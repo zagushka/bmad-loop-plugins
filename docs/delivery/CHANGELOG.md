@@ -1,5 +1,9 @@
 # Delivery changelog
 
+## 0.1.3
+
+Close the HEAD switch/detachment race immediately before new-job pin creation. Prepare a Git transaction that verifies and locks HEAD and its referent at the pinned SHA. Check the attached branch while those locks remain held, then commit the pin or abort. Refused or unsupported transactions create no job or pin. Existing jobs, runs and snapshots are not migrated. Tested with Git 2.50.1 (Apple Git) and 2.53.0; unsupported transaction-control commands fail closed. Git introduced these commands in 2.27, but that older version was not runtime-tested.
+
 ## 0.1.2
 
 New jobs with no native task branch now capture the actual attached source branch at enqueue. The checkout must share the run repository and its HEAD and branch tip must equal the pinned commit. Detached, foreign or moved sources are refused before a job or pin is created. Explicit task branches retain their existing behavior. Repeated enqueue preserves existing job bytes and IDs; old jobs and runs are not migrated.
