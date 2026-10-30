@@ -4,7 +4,7 @@ An independent collection of versioned plugins for bmad-loop.
 
 | Plugin | Version | Purpose |
 | --- | --- | --- |
-| [delivery](docs/delivery/README.md) | 0.1.1 | Deliver exact source commits through checked GitHub PRs and record Ticket Tree acceptance using orchestrator evidence. |
+| [delivery](docs/delivery/README.md) | 0.1.2 | Deliver exact source commits through checked GitHub PRs and record Ticket Tree acceptance using orchestrator evidence. |
 | [codex-notify](docs/codex-notify/README.md) | 1.0.0 | Send advisory run/story journal notifications to one existing Codex chat per run. |
 
 Each plugin runtime is in `plugins/<name>/`. Tests, examples, compatibility metadata and documentation are outside that directory. Documentation edits do not change the installed runtime digest.
@@ -24,7 +24,7 @@ Clone this collection, then review its manager and the selected release:
 ```sh
 git clone https://github.com/zagushka/bmad-loop-plugins.git
 cd bmad-loop-plugins
-python3 -B manage.py install delivery --version 0.1.1 --project /absolute/project
+python3 -B manage.py install delivery --version 0.1.2 --project /absolute/project
 python3 -B manage.py status --project /absolute/project
 ```
 
@@ -66,7 +66,7 @@ Update your collection clone through normal reviewed Git changes, then fetch tag
 
 ```sh
 git fetch origin --tags
-python3 -B manage.py update delivery --version 0.1.1 --project /absolute/project
+python3 -B manage.py update delivery --version 0.1.2 --project /absolute/project
 ```
 
 Use only versions that have been released. The command shows the file/content/executable diff, validates loop compatibility and checks installed bytes against their lock before replacement. An existing unrelated plugin or private configuration is preserved. A locally edited, unowned, missing or symlinked installation is refused. Repeating `install` for the same version is idempotent only when the installed manifest, bytes and locked release commit match. A moved tag fails that check and cannot silently replace an installation.

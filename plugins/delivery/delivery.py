@@ -63,12 +63,12 @@ GIT_LOCAL_ENV = frozenset({
 })
 
 
-def run(args, cwd=None, timeout=120, env=None, strip=True):
+def run(args, cwd=None, timeout=120, env=None, strip=True, stdin=None):
     env = {key: value for key, value in (os.environ if env is None else env).items()
            if key not in GIT_LOCAL_ENV}
     # Kill the process group on timeout, including Git hooks and their children.
     with tempfile.TemporaryFile() as output:
-        process = subprocess.Popen(args, cwd=cwd, env=env, stdout=output,
+        process = subprocess.Popen(args, cwd=cwd, env=env, stdin=stdin, stdout=output,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         try:
             code = process.wait(timeout=timeout)
@@ -187,7 +187,28 @@ def enqueue(cfg, root, run_dir, key, sha=None, phase=None):
     directory = Path(cfg["state_dir"]) / job_id
     with lock(Path(cfg["state_dir"]) / "enqueue.lock", blocking=True):
         if not (directory / "job.json").exists():
-            git(root, "update-ref", f"refs/delivery/{job_id}", sha)
+            source_branch = task.get("branch", "")
+            source_gitdir = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+            if not source_branch:
+                if Path(source_gitdir).resolve() != Path(git(binding_root, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve():
+                    raise Pending("source checkout does not belong to the run repository")
+                try:
+                    source_ref = git(root, "symbolic-ref", "--quiet", "HEAD")
+                except RuntimeError as error:
+                    raise Pending("source branch requires an attached HEAD") from error
+                if (not source_ref.startswith("refs/heads/")
+                        or git(root, "rev-parse", "HEAD") != sha
+                        or git(root, "rev-parse", source_ref) != sha
+                        or git(root, "symbolic-ref", "--quiet", "HEAD") != source_ref):
+                    raise Pending("source branch does not match pinned commit")
+                source_branch = source_ref.removeprefix("refs/heads/")
+                # Verify and pin in one transaction so a moved branch cannot pass capture.
+                with tempfile.TemporaryFile() as commands:
+                    commands.write(f"verify {source_ref} {sha}\nupdate refs/delivery/{job_id} {sha}\n".encode())
+                    commands.seek(0)
+                    run(["git", "update-ref", "--stdin"], root, stdin=commands)
+            else:
+                git(root, "update-ref", f"refs/delivery/{job_id}", sha)
             settings = {}
             for field in ("user.name", "user.email", "core.hooksPath"):
                 try:
@@ -200,9 +221,9 @@ def enqueue(cfg, root, run_dir, key, sha=None, phase=None):
                 settings[field] = value
             atomic(directory / "job.json", dict(identity, id=job_id, plan=plan,
                    title=ticket["title"], stage="code", attempts=0, next_try=0,
-                   status="queued", source_branch=task.get("branch", ""), git_settings=settings,
+                   status="queued", source_branch=source_branch, git_settings=settings,
                    origin=git(root, "remote", "get-url", "origin"),
-                   source_gitdir=git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")))
+                   source_gitdir=source_gitdir))
     return job_id
 
 
