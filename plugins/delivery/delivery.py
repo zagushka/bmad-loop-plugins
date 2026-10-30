@@ -322,6 +322,27 @@ def check_gates(text):
         raise Pending("current plan has unresolved status gate")
 
 
+def accepted_plan(text):
+    """Apply only the supported Ticket Tree mark-done frontmatter edits."""
+    check_gates(text)
+    crlf = "\r\n" in text
+    text = text.replace("\r\n", "\n")
+    match = re.match(r"\A---\n(.*?)\n---(?:\n|\Z)", text, re.S)
+    if not match:
+        raise Pending("malformed native plan")
+    block = match[1]
+    for key, value in (("status", "done"), ("blocked_at", ""), ("blocked_reason", "")):
+        pattern = re.compile(rf"^{key}:.*$\n?", re.M)
+        if not value:
+            block = pattern.sub("", block).rstrip("\n")
+        elif pattern.search(block):
+            block = pattern.sub(lambda _: f"{key}: {value}\n", block, count=1).rstrip("\n")
+        else:
+            block += f"\n{key}: {value}"
+    result = text[:match.start(1)] + block + text[match.end(1):]
+    return result.replace("\n", "\r\n") if crlf else result
+
+
 class Worker:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -345,11 +366,11 @@ class Worker:
     def save(self, directory, job):
         atomic(directory / "job.json", job)
 
-    def evidence(self, directory, job):
+    def evidence(self, directory, job, supplied=None):
         path = directory / "evidence.json"
-        if not path.exists():
+        if supplied is None and not path.exists():
             raise Pending("missing orchestrator evidence")
-        evidence = read(path)
+        evidence = read(path) if supplied is None else supplied
         for key in ("repository", "run", "ticket", "sha", "base", "container"):
             if evidence.get(key) != job[key]:
                 raise Pending(f"evidence identity mismatch: {key}")
@@ -395,7 +416,7 @@ class Worker:
             raise Pending("evidence must cover every contract, verify and plan criterion exactly")
         return evidence
 
-    def ticket(self, checkout, job, sha):
+    def ticket(self, checkout, job, sha, after_proof=None):
         git(checkout, "checkout", "--detach", sha)
         runtime = checkout / "_bmad/custom"
         runtime.mkdir(parents=True, exist_ok=True)
@@ -416,10 +437,10 @@ class Worker:
             check_gates(plan.read_text())
         if found.get("story_file"):
             check_gates(Path(found["story_file"]).read_text())
-        self.prerequisites(checkout, job, found)
+        self.prerequisites(checkout, job, found, after_proof)
         return found
 
-    def prerequisites(self, checkout, job, found):
+    def prerequisites(self, checkout, job, found, after_proof=None):
         script = self.cfg.get("tickets_script", ".agents/skills/bmad-agent-po/scripts/tickets.py")
         status = json.loads(run([sys.executable, script, "--project-root", str(checkout),
                                  "status", job["container"]], checkout))
@@ -431,32 +452,212 @@ class Worker:
                 if row["epic"] == found["epic"]:
                     aliases.update((str(row["id"]), str(row["file"])))
                 if str(dependency) in aliases:
-                    matches.append(row["state"] in (("done", "review") if review else ("done",)))
-            matches.extend(e.get("status") == "done" for e in epics if e["slug"] == dependency)
-            return len(matches) == 1 and matches[0]
+                    matches.append((row["state"] in (("done", "review") if review else ("done",)), row))
+            matches.extend((e.get("status") == "done", None) for e in epics if e["slug"] == dependency)
+            if len(matches) != 1:
+                return False
+            satisfied, row = matches[0]
+            if review and row is not None and after_proof:
+                return after_proof(row, satisfied)
+            return satisfied
         if (any(not satisfied(dep, review=True) for dep in found.get("after", [])) or
                 any(not satisfied(dep) for dep in found.get("gated_by", []))):
             raise Pending("current ticket has unresolved prerequisite gates")
+
+    def child_base_plan(self, checkout, child, base_sha, source_sha):
+        def plan_at(revision):
+            if not git(checkout, "ls-tree", revision, "--", child["plan"]):
+                return None
+            return run(["git", "show", f"{revision}:{child['plan']}"], checkout, strip=False)
+        current = plan_at(base_sha)
+        code_merge = child["code_pr"]["merge_commit_sha"]
+        baseline = git(checkout, "merge-base", code_merge, base_sha)
+        if current == plan_at(baseline):
+            return
+        if current is None:
+            raise Pending("child native plan removed from base")
+        status = re.search(r"(?m)^status: *[\"']?([\w-]+)", current.split("---", 2)[1])
+        if not status or status[1] not in ("built", "done"):
+            raise Pending("child native plan has a newer build/review state on base")
+        check_gates(current)
+        def comparable(text):
+            frontmatter, body = text.split("---", 2)[1:]
+            return re.sub(r"(?m)^status:.*$", "status: built", frontmatter) + "---" + body
+        if comparable(current) not in (comparable(plan_at(source_sha)), comparable(plan_at(code_merge))):
+            raise Pending("child native plan changed on base")
+
+    def accepted_child(self, directory, job, row, base_sha, visiting=None, base_satisfied=False):
+        """Allow only a directly accepted integration child absent from the final base."""
+        checkout = directory / "checkout"
+        visiting = set() if visiting is None else visiting
+        key = str(row["ref"])
+        if key in visiting:
+            raise Pending("accepted child prerequisite proof cycle")
+        visiting.add(key)
+        try:
+            branch = job.get("source_branch")
+            if not branch or branch == job["base"]:
+                raise Pending("accepted child needs a distinct integration source branch")
+            paths = git(checkout, "ls-tree", "-r", "--name-only", job["sha"], "--", job["container"]).splitlines()
+            candidates = []
+            for path in paths:
+                if not re.fullmatch(r"delivery-[0-9a-f]{24}\.json", Path(path).name):
+                    continue
+                audit = json.loads(git(checkout, "show", f"{job['sha']}:{path}"))
+                child = audit.get("job", {})
+                if base_satisfied and child.get("base") != branch:
+                    continue
+                if str(child.get("ticket")) == str(row["ref"]) and child.get("container") == job["container"]:
+                    candidates.append((path, audit))
+            if base_satisfied and not candidates:
+                return True
+            if len(candidates) != 1:
+                raise Pending("accepted child needs exactly one tracked delivery audit")
+            audit_path, audit = candidates[0]
+            child = audit["job"]
+            identity = {key: child[key] for key in ("repository", "run", "ticket", "sha", "base", "container")}
+            expected_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
+            plan = child["plan"]
+            if (child.get("id") != expected_id or child["repository"] != job["repository"] or
+                    child["base"] != branch or child["container"] != job["container"] or
+                    child.get("stage") != "tracking" or
+                    not isinstance(child["run"], str) or not Path(child["run"]).is_absolute() or
+                    not re.fullmatch(r"[0-9a-f]{40}", child["sha"]) or
+                    Path(plan).is_absolute() or ".." in Path(plan).parts or
+                    not Path(plan).is_relative_to(job["container"]) or
+                    audit_path != str(Path(plan).parent / f"delivery-{expected_id}.json") or
+                    audit.get("tracking_branch") != f"delivery/{expected_id}-tracking" or
+                    audit.get("code_pr") != child.get("code_pr")):
+                raise Pending("accepted child audit identity mismatch")
+            # Validate all recorded identities before any auxiliary fetch.
+            recorded = audit["code_pr"]
+            code_branch = f"delivery/{expected_id}-code"
+            def receipt(full, sha, expected_branch):
+                self.confirm_merge(child, sha, full)
+                if (not full.get("merged_at") or full.get("state") != "closed" or
+                        type(full.get("number")) is not int or full["number"] < 1 or
+                        full.get("head", {}).get("ref") != expected_branch or
+                        full.get("head", {}).get("repo", {}).get("full_name") != job["repository"]):
+                    raise Pending("accepted child PR branch/repository mismatch")
+            receipt(recorded, child["sha"], code_branch)
+            self.child_base_plan(checkout, child, base_sha, job["sha"])
+            if base_satisfied:
+                return True
+            verification = child["code_verification"]
+            local, github = verification["local"], verification["github"]
+            commands = [["pnpm", "install", "--frozen-lockfile"], ["pnpm", "lint"],
+                        ["pnpm", "typecheck"], ["pnpm", "test"]]
+            if (verification.get("sha") != child["sha"] or local.get("sha") != child["sha"] or
+                    local.get("platform") != "darwin" or
+                    [r.get("command") for r in local.get("results", [])] != commands or
+                    any(r.get("status") != "passed" for r in local["results"]) or
+                    github.get("actions") not in ("enabled", "disabled") or
+                    not all(isinstance(github.get(key), list) for key in ("checks", "statuses", "workflows")) or
+                    type(github.get("protection", {}).get("protected")) is not bool):
+                raise Pending("accepted child exact-head checks missing")
+            for check in github["checks"]:
+                if (check.get("head_sha") != child["sha"] or check.get("status") != "completed" or
+                        check.get("conclusion") not in ("success", "neutral", "skipped")):
+                    raise Pending("accepted child recorded GitHub check failed or changed head")
+            for workflow in github["workflows"]:
+                if (workflow.get("head_sha") != child["sha"] or workflow.get("status") != "completed" or
+                        workflow.get("conclusion") not in ("success", "neutral", "skipped")):
+                    raise Pending("accepted child recorded workflow failed or changed head")
+            if any(status.get("state") != "success" for status in github["statuses"]):
+                raise Pending("accepted child recorded GitHub status failed")
+            registered = {check["name"] for check in github["checks"]}
+            registered.update(status["context"] for status in github["statuses"])
+            if github["actions"] == "enabled" and (not self.cfg["expected_checks"] or
+                    not set(self.cfg["expected_checks"]) <= registered):
+                raise Pending("accepted child expected checks missing")
+            code = self.pr(child, code_branch)
+            tracking = self.pr(child, audit["tracking_branch"])
+            if not code or not tracking or code.get("number") != recorded.get("number"):
+                raise Pending("accepted child code/tracking PR missing")
+            code_number, tracking_number = code["number"], tracking["number"]
+            code = self.api(f"repos/{job['repository']}/pulls/{code_number}")
+            tracking = self.api(f"repos/{job['repository']}/pulls/{tracking_number}")
+            if code.get("number") != code_number or tracking.get("number") != tracking_number:
+                raise Pending("accepted child PR receipt number mismatch")
+            receipt(code, child["sha"], code_branch)
+            tracking_sha = tracking.get("head", {}).get("sha", "")
+            if not re.fullmatch(r"[0-9a-f]{40}", tracking_sha):
+                raise Pending("accepted child tracking head missing")
+            receipt(tracking, tracking_sha, audit["tracking_branch"])
+            if code["merge_commit_sha"] != recorded["merge_commit_sha"]:
+                raise Pending("accepted child code merge changed")
+            for revision in (child["sha"], tracking_sha, code["merge_commit_sha"], tracking["merge_commit_sha"]):
+                git(checkout, "fetch", "origin", revision)
+            code_merge, tracking_merge = code["merge_commit_sha"], tracking["merge_commit_sha"]
+            for ancestor, descendant in ((code_merge, tracking_merge), (tracking_merge, job["sha"]),
+                                         (code_merge, tracking_sha)):
+                git(checkout, "merge-base", "--is-ancestor", ancestor, descendant)
+            if code_merge == tracking_merge:
+                raise Pending("accepted child needs separate code and tracking merges")
+            for revision in (tracking_sha, tracking_merge):
+                changes = set(git(checkout, "diff", "--name-only", revision + "^", revision).splitlines())
+                if changes != {plan, audit_path} or git(checkout, "ls-tree", revision + "^", "--", audit_path):
+                    raise Pending("accepted child tracking receipt does not introduce only its plan/audit acceptance")
+            def content(revision, path):
+                return run(["git", "show", f"{revision}:{path}"], checkout, strip=False)
+            if (content(tracking_merge, audit_path) != content(job["sha"], audit_path) or
+                    content(tracking_sha, audit_path) != content(tracking_merge, audit_path) or
+                    content(tracking_merge, plan) != content(job["sha"], plan) or
+                    content(tracking_sha, plan) != content(tracking_merge, plan)):
+                raise Pending("accepted child plan/audit changed after acceptance")
+            if accepted_plan(content(child["sha"], plan)) != content(tracking_merge, plan):
+                raise Pending("accepted child plan changed during acceptance")
+            self.evidence(directory, child, supplied=audit["evidence"])
+            accepted = self.ticket(checkout, child, tracking_merge)
+            current = self.ticket(checkout, child, job["sha"])
+            if accepted.get("status") != "done" or current.get("status") != "done":
+                raise Pending("accepted child is not done")
+            audited = self.ticket(checkout, child, child["sha"])
+            base = self.ticket(checkout, child, base_sha,
+                               after_proof=lambda dependency, satisfied: self.accepted_child(
+                                   directory, job, dependency, base_sha, visiting, base_satisfied=satisfied))
+            fields = ("description", "verify", "story_file", "hitl", "done_checkpoint", "after", "gated_by", "unknown")
+            for found in (accepted, current, base):
+                if any(audited.get(field) != found.get(field) for field in fields):
+                    raise Pending("accepted child semantic contract changed")
+            if audited.get("story_file"):
+                path = relative(checkout, audited["story_file"])
+                if any(content(child["sha"], path) != content(revision, path)
+                       for revision in (tracking_merge, job["sha"], base_sha)):
+                    raise Pending("accepted child story contract changed")
+            return True
+        except (KeyError, TypeError, ValueError, AttributeError, IndexError, RecursionError, RuntimeError) as error:
+            raise Pending(f"accepted child proof incomplete: {error}") from error
+        finally:
+            visiting.remove(key)
+            git(checkout, "checkout", "--detach", base_sha)
 
     def current_ticket(self, directory, job, sha):
         checkout = directory / "checkout"
         source = self.ticket(checkout, job, job["sha"])
         git(checkout, "fetch", "origin", job["base"])
-        current = self.ticket(checkout, job, "FETCH_HEAD")
+        base_sha = git(checkout, "rev-parse", "FETCH_HEAD")
+        after_proof = None
+        if job.get("source_branch") and job["source_branch"] != job["base"]:
+            visiting = set()
+            after_proof = lambda row, satisfied: self.accepted_child(
+                directory, job, row, base_sha, visiting, base_satisfied=satisfied)
+        current = self.ticket(checkout, job, base_sha,
+                              after_proof=after_proof)
         for field in ("description", "verify", "story_file", "hitl", "done_checkpoint", "after", "gated_by", "unknown"):
             if source.get(field) != current.get(field):
                 raise Pending("ticket contract or gates changed on base")
         if source.get("story_file"):
             path = relative(checkout, source["story_file"])
-            if git(checkout, "show", f"{job['sha']}:{path}") != git(checkout, "show", f"FETCH_HEAD:{path}"):
+            if git(checkout, "show", f"{job['sha']}:{path}") != git(checkout, "show", f"{base_sha}:{path}"):
                 raise Pending("ticket story changed on base")
         def plan_at(revision):
             if not git(checkout, "ls-tree", revision, "--", job["plan"]):
                 return None
             return git(checkout, "show", f"{revision}:{job['plan']}")
-        pinned_plan, current_plan = plan_at(job["sha"]), plan_at("FETCH_HEAD")
+        pinned_plan, current_plan = plan_at(job["sha"]), plan_at(base_sha)
         # A new plan need not exist on main before the code PR lands.
-        baseline = git(checkout, "merge-base", job["sha"], "FETCH_HEAD")
+        baseline = git(checkout, "merge-base", job["sha"], base_sha)
         unchanged_baseline = not job.get("code_pr") and current_plan == plan_at(baseline)
         if not unchanged_baseline:
             if current_plan is None:
@@ -470,6 +671,7 @@ class Worker:
             if comparable(pinned_plan) != comparable(current_plan):
                 raise Pending("native plan changed on base")
         git(checkout, "checkout", "--detach", sha)
+        return base_sha
 
     def native(self, directory, job, sha, stage):
         record = directory / f"{stage}-checks.json"
@@ -611,8 +813,8 @@ class Worker:
             return sha
         except RuntimeError:
             pass
-        self.current_ticket(directory, job, job["sha"])
-        git(checkout, "checkout", "--detach", "FETCH_HEAD")
+        base_sha = self.current_ticket(directory, job, job["sha"])
+        git(checkout, "checkout", "--detach", base_sha)
         before = git(checkout, "rev-parse", "HEAD")
         script = self.cfg.get("tickets_script", ".agents/skills/bmad-agent-po/scripts/tickets.py")
         found = json.loads(run([sys.executable, script, "--project-root", str(checkout),

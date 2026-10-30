@@ -360,13 +360,13 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(d.obligations("## Local Acceptance Criteria\n\n1. Complete local checks.\n"), ["Complete local checks."])
         self.assertEqual(d.obligations("## Acceptance criteria\n\n- Complete checks.\n"), ["Complete checks."])
 
-    def transport(self, worker, job):
+    def transport(self, worker, job, prs=None, squash=False):
         """Controlled gh; mutations still push and merge real disposable Git refs."""
         # Local bare remotes replace GitHub only in this controlled transport.
         identity = patch.object(d, "github_origin", return_value="https://github.com/owner/repo")
         identity.start()
         self.addCleanup(identity.stop)
-        prs = {}
+        prs = {} if prs is None else prs
         counts = {"code": 0, "tracking": 0}
         def api(endpoint):
             if "/pulls?" in endpoint:
@@ -393,24 +393,413 @@ class DeliveryTest(unittest.TestCase):
                 counts[branch.rsplit("-", 1)[1]] += 1
                 prs[number] = dict(number=number, state="open", merged=False, merged_at=None,
                     head=dict(sha=sha, ref=branch, repo=dict(full_name="owner/repo")),
-                    base=dict(ref="main", repo=dict(full_name="owner/repo")))
+                    base=dict(ref=job["base"], repo=dict(full_name="owner/repo")))
                 return str(number)
             pr = prs[int(args[2])]
             if args[:2] == ("pr", "view"):
-                return json.dumps(dict(headRefOid=pr["head"]["sha"], baseRefName="main",
+                return json.dumps(dict(headRefOid=pr["head"]["sha"], baseRefName=pr["base"]["ref"],
                     mergeStateStatus="CLEAN", reviewDecision="APPROVED", isDraft=False))
             if args[:2] == ("pr", "merge"):
                 self.assertEqual(args[args.index("--match-head-commit") + 1], pr["head"]["sha"])
-                d.git(self.repo, "--git-dir", str(self.remote), "update-ref", "refs/heads/main", pr["head"]["sha"])
-                pr.update(state="closed", merged=True, merged_at="now", merge_commit_sha=pr["head"]["sha"])
+                merged = pr["head"]["sha"]
+                base_ref = f"refs/heads/{pr['base']['ref']}"
+                if squash:
+                    tree = d.git(self.repo, "--git-dir", str(self.remote), "rev-parse", merged + "^{tree}")
+                    parent = d.git(self.repo, "--git-dir", str(self.remote), "rev-parse", base_ref)
+                    merged = d.git(self.repo, "-c", "user.name=Disposable Test", "-c", "user.email=test@example.invalid",
+                                   "--git-dir", str(self.remote), "commit-tree", tree, "-p", parent,
+                                   "-m", f"Squash controlled PR {pr['number']}")
+                d.git(self.repo, "--git-dir", str(self.remote), "update-ref", base_ref, merged)
+                pr.update(state="closed", merged=True, merged_at="now", merge_commit_sha=merged)
                 return "merged"
             raise AssertionError(args)
         worker.api, worker.gh = api, gh
         def native(directory, entry, sha, stage):
             self.assertEqual(d.git(directory / "checkout", "rev-parse", "HEAD"), sha)
-            return dict(sha=sha, results=[dict(status="passed", command=["controlled native checks"])])
+            return dict(sha=sha, platform="darwin", results=[dict(status="passed", command=c) for c in
+                        (["pnpm", "install", "--frozen-lockfile"], ["pnpm", "lint"], ["pnpm", "typecheck"], ["pnpm", "test"])])
         worker.native = native
         return prs, counts
+
+    def integration_fixture(self, multiple=False, transient=False, base_gate=False, child_fields="", child_baseline=False, child_crlf=False):
+        """Accept a child on integration through two real squash merge commits."""
+        self.ticket_fixture(new_plan=not child_baseline)
+        child_plan = self.repo / "initiative/tickets/epic-test/tickets/story-test-plan.md"
+        if child_baseline:
+            child_plan.write_text(child_plan.read_text().replace("status: built", "status: draft"))
+            d.git(self.repo, "add", ".")
+            d.git(self.repo, "commit", "-m", "original child draft plan")
+            d.git(self.repo, "push", "origin", "main")
+            d.git(self.repo, "checkout", "-b", "story")
+            child_plan.write_text(child_plan.read_text().replace("status: draft", "status: built"))
+            d.git(self.repo, "add", ".")
+            d.git(self.repo, "commit", "-m", "build child from original draft")
+        entry_path = "initiative/tickets/epic-test/tickets/tickets.toml"
+        d.git(self.repo, "checkout", "main")
+        entry = self.repo / entry_path
+        entry.write_text(entry.read_text() + '\n[[entry]]\nid = 2\ntype = "story"\ntitle = "Final"\n'
+                         'description = "Given accepted children, final delivery completes."\n'
+                         + ('after = ["1.1", "1.3"]\n\n[[entry]]\nid = 3\ntype = "story"\ntitle = "Second"\n'
+                            'description = "Accept the second child."\nafter = ["1.1"]\n' if multiple else 'after = ["1.1"]\n'))
+        if base_gate:
+            # The child epic has a gate that the final epic does not inherit.
+            entry.write_text(entry.read_text().split('\n[[entry]]\nid = 2', 1)[0])
+            epic = self.repo / "initiative/tickets/epic-test/epic-test.md"
+            epic.write_text(epic.read_text().replace("parent: initiative", "parent: initiative\nafter: [epic-gate]"))
+            breakdown = self.repo / "initiative/tickets/tickets.toml"
+            breakdown.write_text(breakdown.read_text() + '\n[[epic]]\nid = 2\nslug = "epic-final"\ntitle = "Final"\n'
+                                 '\n[[epic]]\nid = 3\nslug = "epic-gate"\ntitle = "Gate"\n')
+            for name in ("final", "gate"):
+                folder = self.repo / f"initiative/tickets/epic-{name}"
+                (folder / "tickets").mkdir(parents=True)
+                (folder / f"epic-{name}.md").write_text(f"---\ntype: epic\ntitle: {name}\nparent: initiative\n---\n")
+                (folder / "tickets/tickets.toml").write_text(
+                    '[[entry]]\nid = 1\ntype = "story"\ntitle = "Final"\n'
+                    'description = "Given accepted children, final delivery completes."\nafter = ["1.1"]\n'
+                    if name == "final" else "")
+        d.git(self.repo, "add", ".")
+        d.git(self.repo, "commit", "-m", "plan final integration delivery")
+        d.git(self.repo, "push", "origin", "main", "main:integration")
+        if base_gate:
+            d.git(self.repo, "checkout", "-b", "integration-gate")
+            gate = self.repo / "initiative/tickets/epic-gate/epic-gate.md"
+            gate.write_text(gate.read_text().replace("type: epic", "type: epic\nstatus: done"))
+            d.git(self.repo, "add", ".")
+            d.git(self.repo, "commit", "-m", "controlled integration-only prerequisite acceptance")
+            d.git(self.repo, "push", "origin", "HEAD:integration")
+        d.git(self.repo, "checkout", "story")
+        d.git(self.repo, "merge", "integration-gate" if base_gate else "main", "--no-edit")
+        if child_fields or child_crlf:
+            text = child_plan.read_text().replace("status: built", "status: built\n" + child_fields)
+            child_plan.write_bytes((text.replace("\n", "\r\n") if child_crlf else text).encode())
+            d.git(self.repo, "add", ".")
+            d.git(self.repo, "commit", "-m", "retain clear native blocked fields")
+        self.state["tasks"]["1.1"]["commit_sha"] = d.git(self.repo, "rev-parse", "HEAD")
+        d.atomic(self.run_dir / "state.json", self.state)
+        child_cfg = dict(self.cfg, base="integration")
+        child_id = d.enqueue(child_cfg, self.repo, self.run_dir, "1.1")
+        child_dir = Path(self.cfg["state_dir"]) / child_id
+        child = d.read(child_dir / "job.json")
+        def evidence_for(job, criterion):
+            contract_path = str(Path(job["plan"]).parent / "tickets.toml")
+            artifacts = [dict(path=p, sha256=hashlib.sha256((self.repo / p).read_bytes()).hexdigest())
+                         for p in ("review.md", contract_path, job["plan"])]
+            evidence = {k: job[k] for k in ("repository", "run", "ticket", "sha", "base", "container")}
+            evidence.update(orchestrator="authorized", operator_gates=[], hitl=False, artifacts=artifacts,
+                            review=dict(status="completed", sha=job["sha"], artifact="review.md"),
+                            contract=dict(path=contract_path),
+                            criteria=[dict(criterion=criterion, status="passed", artifact="review.md")])
+            return evidence
+        d.atomic(child_dir / "evidence.json", evidence_for(child, "Given a job, delivery completes."))
+        child_worker = d.Worker(child_cfg)
+        prs, _ = self.transport(child_worker, child, squash=True)
+        if transient:
+            native = child_worker.native
+            child_worker.native = lambda *a: (_ for _ in ()).throw(d.Pending("controlled transient check"))
+            self.assertFalse(child_worker.process(child_dir / "job.json"))
+            child = d.read(child_dir / "job.json")
+            self.assertEqual(child["status"], "waiting")
+            child_worker.native = native
+        child_worker.advance(child_dir, child)
+        child = d.read(child_dir / "job.json")
+        self.assertEqual(child["stage"], "complete")
+        self.assertNotEqual(child["sha"], child["code_pr"]["merge_commit_sha"])
+        d.git(self.repo, "fetch", "origin", "integration")
+        d.git(self.repo, "checkout", "-b", "integration", "FETCH_HEAD")
+        if multiple:
+            second_plan = self.repo / "initiative/tickets/epic-test/tickets/story-second-plan.md"
+            second_plan.write_text("---\ntitle: Second\nticket: 3\nstatus: built\noperator_actions: []\n---\n")
+            d.git(self.repo, "add", ".")
+            d.git(self.repo, "commit", "-m", "build second integration child")
+            self.state["tasks"]["1.3"] = dict(phase="done", operator_actions=[],
+                commit_sha=d.git(self.repo, "rev-parse", "HEAD"),
+                ticket=dict(ref="1.3", plan=str(second_plan), title="Second"))
+            d.atomic(self.run_dir / "state.json", self.state)
+            second_id = d.enqueue(child_cfg, self.repo, self.run_dir, "1.3")
+            second_dir = Path(self.cfg["state_dir"]) / second_id
+            second = d.read(second_dir / "job.json")
+            d.atomic(second_dir / "evidence.json", evidence_for(second, "Accept the second child."))
+            second_worker = d.Worker(child_cfg)
+            self.transport(second_worker, second, prs=prs, squash=True)
+            second_worker.advance(second_dir, second)
+            d.git(self.repo, "fetch", "origin", "integration")
+            d.git(self.repo, "checkout", "--detach", "FETCH_HEAD")
+        plan = self.repo / f"initiative/tickets/epic-{'final' if base_gate else 'test'}/tickets/story-final-plan.md"
+        plan.write_text(f"---\ntitle: Final\nticket: {1 if base_gate else 2}\nstatus: built\noperator_actions: []\n---\n")
+        # Unrelated entry-only work changes the shared file after child acceptance.
+        entry.write_text(entry.read_text() + '\n[[entry]]\nid = 5\ntype = "story"\ntitle = "Later"\n')
+        d.git(self.repo, "add", ".")
+        d.git(self.repo, "commit", "-m", "build final delivery and plan unrelated work")
+        final_ref = "2.1" if base_gate else "1.2"
+        self.state["tasks"][final_ref] = dict(phase="done", branch="integration", operator_actions=[],
+            commit_sha=d.git(self.repo, "rev-parse", "HEAD"),
+            ticket=dict(ref=final_ref, plan=str(plan), title="Final"))
+        d.atomic(self.run_dir / "state.json", self.state)
+        final_id = d.enqueue(self.cfg, self.repo, self.run_dir, final_ref)
+        directory = Path(self.cfg["state_dir"]) / final_id
+        job = d.read(directory / "job.json")
+        d.atomic(directory / "evidence.json", evidence_for(job, "Given accepted children, final delivery completes."))
+        worker = d.Worker(self.cfg)
+        prs, counts = self.transport(worker, job, prs=prs, squash=True)
+        worker.initialize(directory, job)
+        return directory, job, worker, child, prs, counts
+
+    def test_multiple_accepted_children_after_transient_retry(self):
+        directory, job, worker, child, prs, counts = self.integration_fixture(multiple=True, transient=True)
+        checkout = directory / "checkout"
+        audit_path = str(Path(child["plan"]).parent / f"delivery-{child['id']}.json")
+        audit = json.loads(d.git(checkout, "show", f"{job['sha']}:{audit_path}"))
+        self.assertEqual(audit["job"]["status"], "waiting")
+        self.assertEqual(audit["job"]["source_branch"], "")
+        worker.advance(directory, job)
+        self.assertEqual(d.read(directory / "job.json")["stage"], "complete")
+        self.assertEqual(len(prs), 6)
+        self.assertEqual(counts, dict(code=1, tracking=1))
+
+    def test_child_real_mark_clears_only_supported_blocked_fields(self):
+        for fields, crlf in (('blocked_at: ""\nblocked_reason: ""', False),
+                             ('blocked_at: "2020-01-01"\nblocked_reason: \'\'', False),
+                             ('blocked_at: ""\nblocked_reason: ""', True)):
+            with self.subTest(fields=fields, crlf=crlf):
+                case = DeliveryTest()
+                case.setUp()
+                try:
+                    directory, job, worker, child, _, _ = case.integration_fixture(child_fields=fields, child_crlf=crlf)
+                    checkout = directory / "checkout"
+                    audited = d.git(checkout, "show", f"{child['sha']}:{child['plan']}")
+                    accepted = d.git(checkout, "show", f"{job['sha']}:{child['plan']}")
+                    self.assertIn(fields, audited.replace("\r\n", "\n"))
+                    if crlf:
+                        self.assertIn("\r\n", audited)
+                        self.assertIn("\r\n", accepted)
+                    self.assertNotIn("blocked_reason:", accepted)
+                    self.assertNotIn("blocked_at:", accepted)
+                    worker.current_ticket(directory, job, job["sha"])
+                finally:
+                    case.doCleanups()
+
+    def test_base_child_plan_changes_do_not_overwrite_new_work(self):
+        directory, job, worker, child, _, counts = self.integration_fixture(child_baseline=True)
+        checkout = directory / "checkout"
+        # An unchanged older draft remains a supported baseline.
+        worker.current_ticket(directory, job, job["sha"])
+        original_main = d.git(self.repo, "rev-parse", "main")
+        original = d.git(self.repo, "show", f"{original_main}:{child['plan']}") + "\n"
+        for changed in (None, original.replace("status: draft", "status: in-progress"),
+                        original.replace("status: draft", "status: in-review"),
+                        original + "\n## Tasks & Acceptance\n- Complete new verification.\n",
+                        original.replace("status: draft", 'status: built\nblocked_at: "2030-01-01"'),
+                        original.replace("status: draft", "status: built") + "\n## Verification\nNew review evidence.\n"):
+            with self.subTest(changed=changed):
+                d.git(self.repo, "checkout", "--detach", original_main)
+                plan = self.repo / child["plan"]
+                if changed is None:
+                    plan.unlink()
+                else:
+                    plan.write_text(changed)
+                d.git(self.repo, "add", ".")
+                d.git(self.repo, "commit", "-m", "new main-only child plan state")
+                d.git(self.repo, "push", "--force", "origin", "HEAD:main")
+                before = d.git(self.remote, "show-ref")
+                with self.assertRaisesRegex(d.Pending, "child native plan"):
+                    worker.current_ticket(directory, job, job["sha"])
+                self.assertEqual(d.git(self.remote, "show-ref"), before)
+                self.assertEqual(counts, dict(code=0, tracking=0))
+
+    def test_met_main_prerequisite_does_not_need_integration_receipts(self):
+        directory, job, worker, child, _, _ = self.integration_fixture()
+        source_entry = (self.repo / "initiative/tickets/epic-test/tickets/tickets.toml").read_text()
+        d.git(self.repo, "checkout", "main")
+        entry = self.repo / "initiative/tickets/epic-test/tickets/tickets.toml"
+        entry.write_text(entry.read_text().replace('[[entry]]\nid = 2',
+            '[[entry]]\nid = 6\ntype = "story"\ntitle = "Main"\n\n[[entry]]\nid = 2')
+            .replace('after = ["1.1"]', 'after = ["1.1", "1.6"]'))
+        plan = entry.parent / "story-main-plan.md"
+        plan.write_text("---\ntitle: Main\nticket: 6\nstatus: done\n---\n")
+        d.atomic(entry.parent / ("delivery-" + "f" * 24 + ".json"),
+                 dict(job=dict(ticket="1.6", container="initiative", base="main")))
+        d.git(self.repo, "add", ".")
+        d.git(self.repo, "commit", "-m", "ordinary main-accepted prerequisite")
+        d.git(self.repo, "push", "origin", "main")
+        d.git(self.repo, "checkout", "--detach", job["sha"])
+        try:
+            d.git(self.repo, "merge", "main", "--no-edit")
+        except RuntimeError as error:
+            self.assertIn("CONFLICT", str(error))
+            entry.write_text(source_entry.replace('[[entry]]\nid = 2',
+                '[[entry]]\nid = 6\ntype = "story"\ntitle = "Main"\n\n[[entry]]\nid = 2')
+                .replace('after = ["1.1"]', 'after = ["1.1", "1.6"]'))
+            d.git(self.repo, "add", str(entry))
+            d.git(self.repo, "commit", "--no-edit")
+        job["sha"] = d.git(self.repo, "rev-parse", "HEAD")
+        d.git(directory / "checkout", "fetch", str(self.repo), job["sha"])
+        with patch.object(worker, "pr", wraps=worker.pr) as pr:
+            worker.current_ticket(directory, job, job["sha"])
+            self.assertTrue(pr.call_args_list)
+            self.assertTrue(all(call.args[0]["ticket"] == child["ticket"] for call in pr.call_args_list))
+
+    def test_accepted_child_does_not_waive_its_base_gated_by(self):
+        directory, job, worker, child, prs, counts = self.integration_fixture(base_gate=True)
+        before = d.git(self.remote, "show-ref")
+        with self.assertRaisesRegex(d.Pending, "prerequisite gates"):
+            worker.current_ticket(directory, job, job["sha"])
+        self.assertEqual(d.git(self.remote, "show-ref"), before)
+        self.assertEqual(counts, dict(code=0, tracking=0))
+
+    def test_after_proof_cannot_waive_epic_gated_by_or_ambiguous_dependencies(self):
+        worker = d.Worker(self.cfg)
+        row = dict(ref="1.1", epic="epic-child", id=1, file="", state="planned")
+        status = dict(tickets=[row], epics=[dict(slug="epic-required", status="planned")])
+        for after, gated_by, rows in ((["epic-required"], [], [row]), ([], ["1.1"], [row]),
+                                      (["1.1"], [], [row, row])):
+            with self.subTest(after=after, gated_by=gated_by, count=len(rows)):
+                status["tickets"] = rows
+                with patch.object(d, "run", return_value=json.dumps(status)), patch.object(worker, "accepted_child") as proof:
+                    with self.assertRaisesRegex(d.Pending, "prerequisite gates"):
+                        worker.prerequisites(self.repo, dict(container="initiative"),
+                                             dict(epic="epic-final", after=after, gated_by=gated_by), proof)
+                    proof.assert_not_called()
+
+    def test_child_proof_cycle_is_pending_before_network_or_mutations(self):
+        directory, job = self.queued()
+        worker = d.Worker(self.cfg)
+        before = d.read(directory / "job.json")
+        with patch.object(worker, "api") as api, patch.object(d, "git") as git:
+            with self.assertRaisesRegex(d.Pending, "proof cycle"):
+                worker.accepted_child(directory, job, dict(ref="1.1"), job["sha"], {"1.1"})
+            api.assert_not_called()
+            git.assert_not_called()
+        self.assertEqual(d.read(directory / "job.json"), before)
+
+    def test_accepted_integration_child_final_delivery_and_restart(self):
+        directory, job, worker, child, prs, counts = self.integration_fixture()
+        checkout = directory / "checkout"
+        base = worker.current_ticket(directory, job, job["sha"])
+        self.assertEqual(base, d.git(self.remote, "rev-parse", "main"))
+        # Proof fetches leave FETCH_HEAD at a child receipt, never at main.
+        self.assertNotEqual(base, d.git(checkout, "rev-parse", "FETCH_HEAD"))
+        self.assertEqual(d.git(checkout, "rev-parse", "HEAD"), job["sha"])
+        original = worker.gh
+        interrupted = []
+        def gh(*args):
+            result = original(*args)
+            if args[:2] == ("pr", "merge") and not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt("restart after final code merge")
+            return result
+        worker.gh = gh
+        with self.assertRaises(KeyboardInterrupt):
+            worker.advance(directory, job)
+        worker.gh = original
+        worker.advance(directory, d.read(directory / "job.json"))
+        final = d.read(directory / "job.json")
+        self.assertEqual(final["stage"], "complete")
+        self.assertEqual(counts, dict(code=1, tracking=1))
+        self.assertEqual(len(prs), 4)
+        self.assertEqual(final["tracking_base"], final["code_pr"]["merge_commit_sha"])
+        self.assertIn("status: done", d.git(checkout, "show", f"{final['tracking_sha']}:{job['plan']}"))
+        self.assertEqual(d.git(self.repo, "status", "--porcelain"), "")
+
+    def test_integration_proof_failure_matrix_before_final_push(self):
+        import copy
+        directory, original_job, worker, child, prs, counts = self.integration_fixture()
+        audit_path = str(Path(child["plan"]).parent / f"delivery-{child['id']}.json")
+        original_audit = json.loads((self.repo / audit_path).read_text())
+        original_prs = copy.deepcopy(prs)
+        pinned = original_job["sha"]
+        d.git(self.repo, "fetch", "origin", prs[2]["head"]["sha"])
+        d.git(self.repo, "checkout", "--detach", "FETCH_HEAD")
+        (self.repo / "source").write_text("unrelated tracking change")
+        d.git(self.repo, "add", ".")
+        d.git(self.repo, "commit", "-m", "controlled invalid tracking footprint")
+        bad_tracking_head = d.git(self.repo, "rev-parse", "HEAD")
+        d.git(self.repo, "push", "origin", "HEAD:refs/heads/controlled-invalid-tracking-head")
+        cases = ("missing", "duplicate", "id", "repository", "ticket", "container", "plan", "base", "branch",
+                 "review", "artifact", "native", "check", "check-head", "workflow", "workflow-head", "status",
+                 "expected-check", "code-head", "code-merge", "tracking-missing",
+                 "tracking-duplicate", "tracking-base", "tracking-repo", "tracking-head", "tracking-merge", "tracking-footprint",
+                 "tracking-unmerged", "plan-changed", "audit-changed", "review-only", "human", "contract",
+                 "source-branch-empty", "source-branch-base")
+        for case in cases:
+            with self.subTest(case=case):
+                d.git(self.repo, "checkout", "--detach", pinned)
+                audit = copy.deepcopy(original_audit)
+                job = copy.deepcopy(original_job)
+                prs.clear()
+                prs.update(copy.deepcopy(original_prs))
+                path = self.repo / audit_path
+                if case == "missing":
+                    path.unlink()
+                elif case == "duplicate":
+                    duplicate = path.with_name("delivery-" + "f" * 24 + ".json")
+                    duplicate.write_text(json.dumps(audit))
+                elif case in ("id", "repository", "ticket", "container", "plan", "base"):
+                    audit["job"][case] = "foreign"
+                elif case == "branch":
+                    audit["tracking_branch"] = "foreign"
+                elif case == "review":
+                    audit["evidence"]["review"]["sha"] = "0" * 40
+                elif case == "audit-changed":
+                    audit["tracking_audit"] = "changed after acceptance"
+                elif case == "artifact":
+                    audit["evidence"]["artifacts"][0]["sha256"] = "0" * 64
+                elif case == "native":
+                    audit["job"]["code_verification"]["local"]["results"][1]["status"] = "failed"
+                elif case in ("check", "check-head", "workflow", "workflow-head", "status", "expected-check"):
+                    github = audit["job"]["code_verification"]["github"]
+                    if case == "status":
+                        github["statuses"] = [dict(context="ci", state="failure")]
+                    elif case == "expected-check":
+                        github["actions"] = "enabled"
+                    else:
+                        github["checks" if case.startswith("check") else "workflows"] = [dict(
+                            name="ci", head_sha="0" * 40 if case.endswith("head") else child["sha"],
+                            status="completed", conclusion="success" if case.endswith("head") else "cancelled")]
+                elif case == "code-head":
+                    prs[1]["head"]["sha"] = pinned
+                elif case == "code-merge":
+                    prs[1]["merge_commit_sha"] = pinned
+                elif case == "tracking-missing":
+                    del prs[2]
+                elif case == "tracking-duplicate":
+                    prs[3] = copy.deepcopy(prs[2])
+                elif case == "tracking-base":
+                    prs[2]["base"]["ref"] = "main"
+                elif case == "tracking-repo":
+                    prs[2]["head"]["repo"]["full_name"] = "foreign/repo"
+                elif case == "tracking-head":
+                    prs[2]["head"]["ref"] = "foreign"
+                elif case == "tracking-merge":
+                    prs[2]["merge_commit_sha"] = pinned
+                elif case == "tracking-footprint":
+                    prs[2]["head"]["sha"] = bad_tracking_head
+                elif case == "tracking-unmerged":
+                    prs[2]["merged"] = False
+                elif case in ("plan-changed", "review-only", "human"):
+                    plan = self.repo / child["plan"]
+                    plan.write_text(plan.read_text().replace("status: done", "status: built") if case == "review-only"
+                                    else plan.read_text() + ("\nChanged acceptance.\n" if case == "plan-changed" else ""))
+                    if case == "human":
+                        plan.write_text(plan.read_text().replace("operator_actions: []", "operator_actions: [approve]"))
+                elif case == "contract":
+                    contract = self.repo / "initiative/tickets/epic-test/tickets/tickets.toml"
+                    contract.write_text(contract.read_text().replace("Given a job, delivery completes.", "Changed child contract."))
+                elif case == "source-branch-empty":
+                    job["source_branch"] = ""
+                elif case == "source-branch-base":
+                    job["source_branch"] = "main"
+                if case != "missing":
+                    path.write_text(json.dumps(audit, indent=2))
+                d.git(self.repo, "add", ".")
+                d.git(self.repo, "commit", "--allow-empty", "-m", f"controlled invalid proof {case}")
+                job["sha"] = d.git(self.repo, "rev-parse", "HEAD")
+                d.git(directory / "checkout", "fetch", str(self.repo), job["sha"])
+                before = d.git(self.remote, "show-ref")
+                with self.assertRaises(d.Pending):
+                    worker.current_ticket(directory, job, job["sha"])
+                self.assertEqual(d.git(self.remote, "show-ref"), before)
+                self.assertEqual(counts, dict(code=0, tracking=0))
+        d.git(self.repo, "checkout", "--detach", pinned)
 
     def test_full_advance_and_mutation_crash_recovery(self):
         # Each crash leaves external facts intact and discards only the in-memory job.
