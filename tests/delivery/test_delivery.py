@@ -45,6 +45,11 @@ class DeliveryTest(unittest.TestCase):
                           ticket=dict(ref="1.1", plan=str(self.repo / "initiative/plan.md"), title="Test"))})
         d.atomic(self.run_dir / "state.json", self.state)
 
+    @staticmethod
+    def native_receipt(sha):
+        return dict(sha=sha, platform="darwin", results=[dict(status="passed", command=c) for c in
+                    (["pnpm", "install", "--frozen-lockfile"], ["pnpm", "lint"], ["pnpm", "typecheck"], ["pnpm", "test"])])
+
     def queued(self):
         key = d.enqueue(self.cfg, self.repo, self.run_dir, "1.1")
         path = Path(self.cfg["state_dir"]) / key
@@ -537,7 +542,7 @@ class DeliveryTest(unittest.TestCase):
 
     def test_saved_merge_reconciles_without_duplicate_mutation(self):
         directory, job = self.queued()
-        job["code_verification"] = dict(sha=self.sha)
+        job["code_verification"] = dict(sha=self.sha, local=self.native_receipt(self.sha))
         worker = d.Worker(self.cfg)
         worker.pr = lambda *args: dict(number=1, head=dict(sha=self.sha), merged_at="now")
         worker.api = lambda *args: dict(merged=True, merge_commit_sha=self.sha, head=dict(sha=self.sha), base=dict(ref="main", repo=dict(full_name="owner/repo")))
@@ -550,6 +555,160 @@ class DeliveryTest(unittest.TestCase):
             with d.lock(self.root / "lock") as second:
                 self.assertTrue(first)
                 self.assertFalse(second)
+
+    def test_push_policy_is_explicit_and_invalid_values_fail_closed(self):
+        path = self.root / "config.json"
+        for policy in (None, True, False, "", "optional", [], {}):
+            with self.subTest(policy=policy):
+                cfg = dict(self.cfg, push_policy=policy)
+                d.atomic(path, cfg)
+                with self.assertRaisesRegex(ValueError, "push_policy"):
+                    d.config(path)
+                with self.assertRaisesRegex(ValueError, "push_policy"):
+                    d.Worker(cfg)
+        self.assertEqual(d.Worker(self.cfg).push_policy, "hook-required")
+        for policy in ("hook-required", "native-checks-only"):
+            d.atomic(path, dict(self.cfg, push_policy=policy))
+            self.assertEqual(d.Worker(d.config(path)).push_policy, policy)
+
+    def test_merged_pr_recovery_requires_complete_saved_native_checks(self):
+        directory, job = self.queued()
+        for policy in ("hook-required", "native-checks-only"):
+            worker = d.Worker(dict(self.cfg, push_policy=policy))
+            worker.pr = lambda *a: dict(number=1, head=dict(sha=self.sha), merged_at="now")
+            for verification in (None, True, {"sha": "0" * 40}, {"sha": self.sha},
+                                 dict(sha=self.sha, local=dict(sha=self.sha))):
+                with self.subTest(policy=policy, verification=verification):
+                    job["code_verification"] = verification
+                    with patch.object(worker, "api") as api, patch.object(worker, "gh") as gh:
+                        with self.assertRaises(d.Pending):
+                            worker.deliver(directory, job, self.sha, "branch", "code")
+                        api.assert_not_called()
+                        gh.assert_not_called()
+
+    def test_installed_hook_source_changes_stop_pr_creation_in_both_policies(self):
+        directory, job, _ = self.ticket_fixture()
+        hook = self.repo / ".git/hooks/pre-push"
+        hook.write_text("#!/bin/sh\nprintf dirty > source\n")
+        checkout = directory / "checkout"
+        for policy in ("hook-required", "native-checks-only"):
+            with self.subTest(policy=policy):
+                worker = d.Worker(dict(self.cfg, push_policy=policy))
+                prs, _ = self.transport(worker, job)
+                with self.assertRaisesRegex(d.Pending, "clean pinned checkout"):
+                    worker.deliver(directory, job, self.sha, "delivery/dirty-hook-code", "code")
+                self.assertEqual(prs, {})
+                self.assertEqual((checkout / "source").read_text(), "dirty")
+                d.git(checkout, "restore", "source")
+
+    def test_native_receipt_failures_block_all_delivery_mutations(self):
+        import copy
+        directory, job, _ = self.ticket_fixture()
+        self.cfg["push_policy"] = "native-checks-only"
+        (self.repo / ".git/hooks/pre-push").unlink()
+        worker = d.Worker(self.cfg)
+        self.transport(worker, job)
+        valid = self.native_receipt(job["sha"])
+        failed, stale, missing = (copy.deepcopy(valid) for _ in range(3))
+        failed["results"][1]["status"] = "failed"
+        stale["sha"] = "0" * 40
+        missing["results"].pop()
+        before = d.git(self.remote, "show-ref")
+        for stage in ("code", "tracking"):
+            for existing_pr in (False, True):
+                for receipt in (None, {}, failed, stale, missing):
+                    with self.subTest(stage=stage, existing_pr=existing_pr, receipt=receipt):
+                        pr = dict(state="open", head=dict(sha=job["sha"])) if existing_pr else None
+                        with patch.object(worker, "pr", return_value=pr), patch.object(worker, "native", return_value=receipt), patch.object(worker, "gh") as gh:
+                            with self.assertRaisesRegex(d.Pending, "successful native checks"):
+                                worker.deliver(directory, job, job["sha"], "delivery/test-" + stage, stage)
+                            gh.assert_not_called()
+                        self.assertEqual(d.git(self.remote, "show-ref"), before)
+        d.atomic(directory / "code-checks.json", failed)
+        with patch.object(worker, "native", side_effect=lambda *a: d.Worker.native(worker, *a)), patch.object(worker, "gh") as gh:
+            with self.assertRaisesRegex(d.Pending, "successful native checks"):
+                worker.deliver(directory, job, job["sha"], "delivery/test-code", "code")
+            gh.assert_not_called()
+        with patch.object(worker, "native", side_effect=RuntimeError("native command failed")), patch.object(worker, "gh") as gh:
+            with self.assertRaisesRegex(RuntimeError, "native command failed"):
+                worker.deliver(directory, job, job["sha"], "delivery/test-code", "code")
+            gh.assert_not_called()
+        self.assertEqual(d.git(self.remote, "show-ref"), before)
+
+    def test_native_checks_only_rejects_source_drift_and_preserves_review_gate(self):
+        directory, job, _ = self.ticket_fixture()
+        self.cfg["push_policy"] = "native-checks-only"
+        (self.repo / ".git/hooks/pre-push").unlink()
+        worker = d.Worker(self.cfg)
+        prs, _ = self.transport(worker, job)
+        checkout = directory / "checkout"
+        original_native, original_gh = worker.native, worker.gh
+        def dirty(*a):
+            receipt = original_native(*a)
+            (checkout / "source").write_text("unverified drift")
+            return receipt
+        with patch.object(worker, "native", side_effect=dirty), patch.object(worker, "gh") as gh:
+            with self.assertRaisesRegex(d.Pending, "clean pinned checkout"):
+                worker.deliver(directory, job, job["sha"], "delivery/test-code", "code")
+            gh.assert_not_called()
+        with patch.object(worker, "native") as native:
+            with self.assertRaisesRegex(d.Pending, "clean pinned checkout"):
+                worker.deliver(directory, job, job["sha"], "delivery/test-code", "code")
+            native.assert_not_called()
+        d.git(checkout, "restore", "source")
+        def gh(*args):
+            if args[:2] == ("pr", "view"):
+                data = json.loads(original_gh(*args))
+                data["reviewDecision"] = "CHANGES_REQUESTED"
+                return json.dumps(data)
+            return original_gh(*args)
+        with patch.object(worker, "gh", side_effect=gh):
+            with self.assertRaisesRegex(d.Pending, "protection/review"):
+                worker.deliver(directory, job, job["sha"], "delivery/test-code", "code")
+        self.assertEqual(len(prs), 1)
+        self.assertFalse(next(iter(prs.values()))["merged"])
+
+    def test_native_commands_finish_before_push_and_hook_policy_applies(self):
+        for policy, failure in (("hook-required", None), ("native-checks-only", "lint"),
+                                ("native-checks-only", None)):
+            with self.subTest(policy=policy, failure=failure):
+                case = DeliveryTest()
+                case.setUp()
+                try:
+                    directory, job, _ = case.ticket_fixture()
+                    (case.repo / ".git/hooks/pre-push").unlink()
+                    worker = d.Worker(dict(case.cfg, push_policy=policy))
+                    prs, _ = case.transport(worker, job)
+                    worker.native = lambda *a: d.Worker.native(worker, *a)
+                    original, commands, pushed = d.run, [], []
+                    def run(args, *a, **kw):
+                        if args == ["node", "--version"]:
+                            return "v22.0.0"
+                        if args == ["pnpm", "--version"]:
+                            return "10.17.1"
+                        if args[0] == "pnpm":
+                            commands.append(args)
+                            if args == ["pnpm", failure]:
+                                raise RuntimeError("controlled native failure")
+                            return "controlled native success"
+                        if args[:2] == ["git", "push"]:
+                            self.assertEqual(commands, [r["command"] for r in self.native_receipt(job["sha"])["results"]])
+                            self.assertEqual(d.read(directory / "code-checks.json")["sha"], job["sha"])
+                            pushed.append(args)
+                        return original(args, *a, **kw)
+                    with patch.object(d, "run", side_effect=run), patch.object(d.sys, "platform", "darwin"):
+                        if policy == "hook-required":
+                            with self.assertRaisesRegex(d.Pending, "pre-push hook is absent"):
+                                worker.deliver(directory, job, job["sha"], "delivery/test-code", "code")
+                        elif failure:
+                            with self.assertRaisesRegex(RuntimeError, "native failure"):
+                                worker.deliver(directory, job, job["sha"], "delivery/test-code", "code")
+                        else:
+                            self.assertTrue(worker.deliver(directory, job, job["sha"], "delivery/test-code", "code")["merged"])
+                    self.assertEqual(len(pushed), int(policy == "native-checks-only" and not failure))
+                    self.assertEqual(len(prs), len(pushed))
+                finally:
+                    case.doCleanups()
 
     def test_missing_and_stale_evidence_stay_pending(self):
         directory, job = self.queued()
@@ -742,8 +901,7 @@ class DeliveryTest(unittest.TestCase):
         worker.api, worker.gh = api, gh
         def native(directory, entry, sha, stage):
             self.assertEqual(d.git(directory / "checkout", "rev-parse", "HEAD"), sha)
-            return dict(sha=sha, platform="darwin", results=[dict(status="passed", command=c) for c in
-                        (["pnpm", "install", "--frozen-lockfile"], ["pnpm", "lint"], ["pnpm", "typecheck"], ["pnpm", "test"])])
+            return self.native_receipt(sha)
         worker.native = native
         return prs, counts
 
@@ -1134,11 +1292,17 @@ class DeliveryTest(unittest.TestCase):
 
     def test_full_advance_and_mutation_crash_recovery(self):
         # Each crash leaves external facts intact and discards only the in-memory job.
-        for crash in (None, "push", "code-pr", "code-merge", "mark", "tracking-commit", "tracking-pr", "tracking-merge"):
-            with self.subTest(crash=crash):
+        cases = [(crash, "hook-required") for crash in
+                 (None, "push", "code-pr", "code-merge", "mark", "tracking-commit", "tracking-pr", "tracking-merge")]
+        cases += [(crash, "native-checks-only") for crash in (None, "code-merge", "tracking-pr")]
+        for crash, policy in cases:
+            with self.subTest(crash=crash, policy=policy):
                 case = DeliveryTest()
                 case.setUp()
                 try:
+                    case.cfg["push_policy"] = policy
+                    if policy == "native-checks-only":
+                        (case.repo / ".git/hooks/pre-push").unlink()
                     directory, job, evidence = case.ticket_fixture(new_plan=True)
                     import shutil
                     shutil.rmtree(directory / "checkout")
@@ -1405,17 +1569,17 @@ class DeliveryTest(unittest.TestCase):
                     d.git(checkout, "checkout", "--detach", case.sha)
                     worker.pr = lambda *a: None
                     worker.current_ticket = lambda *a: None
-                    worker.native = lambda *a: dict(sha=case.sha)
+                    worker.native = lambda *a: self.native_receipt(case.sha)
                     worker.gh = lambda *a: (_ for _ in ()).throw(d.Pending("stop after actual push"))
                     with self.assertRaisesRegex(d.Pending, "after actual push"):
                         worker.deliver(directory, job, case.sha, "hook-test", "code")
                     self.assertEqual(marker.read_text(), "ran")
                     effective = Path(d.git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"))
                     effective.chmod(0o600)
-                    with self.assertRaisesRegex(d.Pending, "not executable"):
+                    with self.assertRaisesRegex(d.Pending, "clean pinned checkout" if layout == "relative" else "not executable"):
                         worker.deliver(directory, job, case.sha, "hook-missing", "code")
                     effective.unlink()
-                    with self.assertRaisesRegex(d.Pending, "absent"):
+                    with self.assertRaisesRegex(d.Pending, "clean pinned checkout" if layout == "relative" else "absent"):
                         worker.deliver(directory, job, case.sha, "hook-missing", "code")
                 finally:
                     case.doCleanups()

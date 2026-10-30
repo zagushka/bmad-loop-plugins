@@ -3,6 +3,7 @@
   "base": "main",
   "state_dir": "/absolute/private/delivery-state",
   "orchestrators": ["authorized-delivery-orchestrator"],
+  "push_policy": "hook-required",
   "expected_checks": ["documented-ci-job-name"],
   "command_timeout": 120,
   "check_timeout": 1800,

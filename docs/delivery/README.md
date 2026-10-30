@@ -14,6 +14,7 @@ Create a private JSON configuration **outside the repository**, owned by your us
   "base": "main",
   "state_dir": "/absolute/private/delivery-state",
   "orchestrators": ["authorized-delivery-orchestrator"],
+  "push_policy": "hook-required",
   "expected_checks": ["documented-ci-job-name"],
   "command_timeout": 120,
   "check_timeout": 1800,
@@ -24,6 +25,14 @@ Create a private JSON configuration **outside the repository**, owned by your us
 ```
 
 Set the actual expected check names when Actions are enabled. An explicit empty list is permitted for a repository with Actions disabled. Protected branch checks remain required even when Actions are disabled. An unreadable Actions or protection response stops delivery. The plugin never changes Actions settings.
+
+`push_policy` is optional. Its default is `"hook-required"`: after native checks, a new PR push requires an executable effective `pre-push` hook. A project can explicitly set `"push_policy": "native-checks-only"` to allow delivery without that hook. Other values, including null and booleans, are refused. This setting changes only the hook requirement. It does not disable any installed hook, add `--no-verify`, alter Git or SSH settings, or remove a hook. Normal Git push still executes any hook that is present; the project must manage removal separately.
+
+Both policies require a clean pinned checkout and complete successful macOS receipts for frozen install, lint, typecheck and full tests at the exact delivered SHA before push/PR creation/merge. Missing, failed, malformed or stale returned receipts stop delivery. A matching cached receipt must satisfy the same requirements. Code and tracking commits have separate SHA-bound checks. Completed review/evidence, Actions and branch protection checks, guarded merges and both acceptance PRs remain required. A changed checkout stops delivery even if a valid cached receipt exists.
+
+The worker checks the pinned checkout again after push and before merge. If an installed hook changes local source during push, PR creation stops; the already-pushed, checked SHA branch can remain for recovery. It is not replaced with the changed local HEAD. Recovery of an already-merged PR also requires the saved verification SHA and complete successful native receipts; a SHA-only placeholder is not acceptance proof.
+
+For a policy change, prepare a new private future configuration copy between idle runs and review its use with the new plugin grant/snapshot. Preserve original configurations, jobs/runs, evidence, pins and snapshots; do not backfill or replay historical state. Configuration is worker-wide: a worker applies it to every runnable job in its configured state directory, so do not use a new-policy worker to migrate historical pending jobs implicitly. Installation does not start a loop or worker.
 
 In the ignored loop policy:
 
@@ -88,7 +97,7 @@ Run `status` to obtain the exact identity fields, then supply JSON with this sha
 
 Every artifact must be tracked at the pinned source commit. Criteria are read from the bound story or entry description. `Acceptance Criteria`, `Local Acceptance Criteria`, `Requirements`, and native-plan `Tasks & Acceptance` sections are recognized without case restrictions. An ordinary entry description needs no added heading. Include every numbered or bullet item and each prose paragraph, with continuation lines, as an exact criterion string; omit list numbers and checkbox prefixes. Bold labels such as `**Acceptance Criteria:**` are labels, not criteria. The entry’s `verify` instructions and native-plan acceptance/tasks also need evidence. Identical obligations require one record. For entry-only tickets, use that entry’s `tickets/tickets.toml` as the contract artifact. Include the native plan as a hashed artifact too. An unrelated document cannot supply acceptance criteria. Every obligation must have one passed evidence record. Missing verification or plan obligations stay pending. The orchestrator is responsible for factual evidence quality; this worker verifies identity, completeness and artifact integrity.
 
-The worker rechecks the current base ticket and gates before merge and before marking. A changed contract, verification instruction, plan obligation, HITL flag or blocked/parked state stops acceptance. Only frontmatter supplies plan/story gates: empty operator-action lists or blocks are clear; nonempty or unrecognized values stop acceptance. Historical body text does not change those gates. It executes a frozen install and lint/typecheck/test in its own clone, preserves the configured Git identity and hooks, and makes a normal push with the pre-push hook. Native success is tied to the exact SHA. Actions workflow runs, check runs and statuses are paginated; queued workflows and missing expected checks prevent merge. GitHub reviews and merge protection remain enforced. Merges use `--match-head-commit`; a queue request is not a confirmed merge.
+The worker rechecks the current base ticket and gates before merge and before marking. A changed contract, verification instruction, plan obligation, HITL flag or blocked/parked state stops acceptance. Only frontmatter supplies plan/story gates: empty operator-action lists or blocks are clear; nonempty or unrecognized values stop acceptance. Historical body text does not change those gates. It executes a frozen install and lint/typecheck/test in its own clone, preserves the configured Git identity and hooks, and makes a normal Git push under the configured push policy. Native success is tied to the exact SHA. Actions workflow runs, check runs and statuses are paginated; queued workflows and missing expected checks prevent merge. GitHub reviews and merge protection remain enforced. Merges use `--match-head-commit`; a queue request is not a confirmed merge.
 
 ### Accepted integration prerequisites
 

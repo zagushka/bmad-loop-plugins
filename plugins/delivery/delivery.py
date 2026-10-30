@@ -146,11 +146,35 @@ def lock(path, blocking=False):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
+def push_policy(cfg):
+    policy = cfg.get("push_policy", "hook-required")
+    if policy not in ("hook-required", "native-checks-only"):
+        raise ValueError("push_policy must be hook-required or native-checks-only")
+    return policy
+
+
+def check_native(receipt, sha):
+    results = receipt.get("results") if isinstance(receipt, dict) else None
+    commands = [["pnpm", "install", "--frozen-lockfile"], ["pnpm", "lint"],
+                ["pnpm", "typecheck"], ["pnpm", "test"]]
+    if (not isinstance(results, list) or receipt.get("sha") != sha or receipt.get("platform") != "darwin"
+            or not all(isinstance(row, dict) for row in results)
+            or [row.get("command") for row in results] != commands
+            or any(row.get("status") != "passed" for row in results)):
+        raise Pending("complete successful native checks for the exact source SHA are required")
+
+
+def check_source(checkout, sha):
+    if git(checkout, "rev-parse", "HEAD") != sha or git(checkout, "status", "--porcelain"):
+        raise Pending("delivery requires a clean pinned checkout")
+
+
 def config(path):
     path = Path(path).expanduser().resolve()
     if path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o022:
         raise ValueError("configuration must be owned by this user and not group/world writable")
     value = read(path)
+    push_policy(value)
     for field in ("repository", "base", "state_dir", "orchestrators", "expected_checks"):
         if field not in value:
             raise ValueError(f"missing setting: {field}")
@@ -429,6 +453,7 @@ def accepted_plan(text):
 class Worker:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.push_policy = push_policy(cfg)
 
     def gh(self, *args):
         return run(["gh", *args], timeout=self.cfg.get("command_timeout", 120))
@@ -838,22 +863,28 @@ class Worker:
         if pr and pr["head"]["sha"] != sha:
             raise Pending("PR head changed; new evidence required")
         if pr and pr.get("merged_at"):
-            if not job.get(f"{stage}_verification"):
+            verification = job.get(f"{stage}_verification")
+            if not isinstance(verification, dict) or verification.get("sha") != sha:
                 raise Pending("merged PR lacks saved exact-head verification")
+            check_native(verification.get("local"), sha)
             full = self.api(f"repos/{job['repository']}/pulls/{pr['number']}")
             return self.confirm_merge(job, sha, full)
         if pr and pr["state"] != "open":
             raise Pending("PR closed without merge")
         self.current_ticket(directory, job, sha)
+        check_source(checkout, sha)
         local = self.native(directory, job, sha, stage)
+        check_native(local, sha)
+        check_source(checkout, sha)
         if not pr:
             # Native install may replace the hook; validate the effective hook at push time.
             hook = Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"))
-            if not hook.is_file() or not os.access(hook, os.X_OK):
+            if self.push_policy == "hook-required" and (not hook.is_file() or not os.access(hook, os.X_OK)):
                 raise Pending("required pre-push hook is absent or not executable")
             run(["git", "push", "origin", f"{sha}:refs/heads/{branch}"], checkout,
                 timeout=self.cfg.get("check_timeout", 1800),
                 env=dict(os.environ, WXT_PREMIUM_API_URL="http://localhost:8787"))
+            check_source(checkout, sha)
             body = directory / f"{stage}-body.md"
             body.write_text(f"Deliver ticket {job['ticket']} ({stage}).\n\nVerified source: {sha}\nDelivery job: {job['id']}\n")
             self.gh("pr", "create", "--repo", job["repository"], "--head", branch,
@@ -870,6 +901,7 @@ class Worker:
             raise Pending("GitHub protection/review/mergeability gate")
         self.evidence(directory, job)
         self.current_ticket(directory, job, sha)
+        check_source(checkout, sha)
         job[f"{stage}_verification"] = dict(local=local, github=checks, sha=sha)
         self.save(directory, job)
         self.gh("pr", "merge", str(pr["number"]), "--repo", job["repository"],

@@ -1,6 +1,6 @@
 [plugin]
 name = "delivery"
-version = "0.1.4"
+version = "0.2.0"
 api_version = 1
 description = "Independent, exact-head GitHub delivery and Ticket Tree acceptance"
 
