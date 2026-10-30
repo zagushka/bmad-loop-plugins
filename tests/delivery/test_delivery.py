@@ -353,6 +353,70 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(d.git(self.repo, "for-each-ref", "refs/delivery/"), pins)
         self.assertEqual((Path(ctx.run_dir) / "state.json").read_bytes(), before)
 
+    def test_redirected_descendants_after_graceful_abort_or_early_git_exit(self):
+        for outcome in ("graceful-abort", "early-exit", "success"):
+            with self.subTest(outcome=outcome):
+                case = DeliveryTest()
+                case.setUp()
+                pid_file, release = case.root / "child.pid", case.root / "release-hook"
+                try:
+                    hook = case.repo / ".git/hooks/reference-transaction"
+                    wait = (f'while [ ! -e "{release}" ]; do sleep 0.01; done\n'
+                            if outcome != "success" else "")
+                    hook.write_text('#!/bin/sh\nif [ "$1" = "prepared" ]; then\n'
+                                    f'sleep 60 >/dev/null 2>&1 &\necho $! > "{pid_file}"\n'
+                                    + wait + ('exit 1\n' if outcome == "early-exit" else '') + 'fi\nexit 0\n')
+                    hook.chmod(0o700)
+                    popen, result, killpg = d.subprocess.Popen, d.concurrent.futures.Future.result, d.os.killpg
+                    transaction, signals, reads = [], [], []
+                    def start(args, *a, **kw):
+                        process = popen(args, *a, **kw)
+                        if args == ["git", "update-ref", "--stdin"]:
+                            transaction.append(process)
+                        return process
+                    def read(future, timeout=None):
+                        reads.append(True)
+                        if len(reads) != 2 or outcome == "success":
+                            return result(future, timeout=10)
+                        deadline = d.time.monotonic() + 10
+                        while not pid_file.exists() and d.time.monotonic() < deadline:
+                            d.time.sleep(0.01)
+                        self.assertTrue(pid_file.exists(), "prepared hook did not start")
+                        try:
+                            return result(future, timeout=0.05)
+                        except TimeoutError:
+                            release.touch()
+                            if outcome == "early-exit":
+                                transaction[0].wait(timeout=10)
+                            raise
+                    def stop(group, sig):
+                        signals.append(sig)
+                        return killpg(group, sig)
+                    with patch.object(d.subprocess, "Popen", side_effect=start), patch.object(d.concurrent.futures.Future, "result", read), patch.object(d.os, "killpg", side_effect=stop):
+                        if outcome == "success":
+                            case.queued()
+                        else:
+                            with self.assertRaises(TimeoutError):
+                                case.queued()
+                    pid = int(pid_file.read_text())
+                    status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+                    if outcome == "success":
+                        self.assertTrue(status and not status.startswith("Z"), status)
+                        self.assertEqual(signals, [])
+                    else:
+                        self.assertTrue(not status or status.startswith("Z"), status)
+                        self.assertEqual(signals, [d.signal.SIGKILL])
+                        self.assertEqual(d.git(case.repo, "for-each-ref", "refs/delivery/"), "")
+                        self.assertEqual(list(Path(case.cfg["state_dir"]).glob("*/job.json")), [])
+                    self.assertEqual(list((case.repo / ".git").rglob("*.lock")), [])
+                    hook.unlink()
+                    case.queued()
+                finally:
+                    if pid_file.exists():
+                        with d.contextlib.suppress(ProcessLookupError):
+                            os.kill(int(pid_file.read_text()), d.signal.SIGKILL)
+                    case.doCleanups()
+
     def test_missing_branch_rejects_foreign_repository_with_same_commit(self):
         other = self.root / "other"
         d.git(self.repo, "clone", str(self.repo), str(other))

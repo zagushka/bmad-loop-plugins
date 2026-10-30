@@ -173,6 +173,7 @@ def pin_source(root, source_ref, sha, job_id):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
             text=True, start_new_session=True)
         commit_timeout = None
+        commit_acknowledged = False
         try:
             process.stdin.write(f"start\nverify HEAD {sha}\nupdate refs/delivery/{job_id} {sha}\nprepare\n")
             process.stdin.flush()
@@ -195,6 +196,7 @@ def pin_source(root, source_ref, sha, job_id):
                 if process.returncode or output != "commit: ok\n":
                     errors.seek(0)
                     raise RuntimeError("source pin commit refused: " + errors.read().decode(errors="replace")[-3000:])
+                commit_acknowledged = True
         finally:
             if process.poll() is None:
                 if not process.stdin.closed:
@@ -206,15 +208,17 @@ def pin_source(root, source_ref, sha, job_id):
                 try:
                     process.communicate(timeout=5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGTERM)
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGTERM)
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         pass
-                    # A hook can ignore SIGTERM even after Git has cleaned up and exited.
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+            if not commit_acknowledged:
+                # Descendants can outlive a graceful abort or an already-exited Git leader.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
             with contextlib.suppress(BrokenPipeError):
                 process.stdin.close()
             process.stdout.close()
