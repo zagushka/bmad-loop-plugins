@@ -1,5 +1,9 @@
 # Delivery changelog
 
+## 0.2.0
+
+Add optional per-project `push_policy`: `hook-required` remains the default; `native-checks-only` explicitly permits no pre-push hook. Invalid values fail closed. Both modes require complete successful exact-SHA native frozen install/lint/typecheck/test receipts and a clean pinned checkout before delivery mutations. Existing hooks still execute through normal Git push. No hook disabling, SSH change, weakened review/protection or acceptance bypass is added. Code and tracking delivery/recovery remain checked. Original configurations, old jobs/runs and snapshots are not migrated; activate a reviewed future configuration separately between runs.
+
 ## 0.1.4
 
 Stop remaining transaction-group descendants after an aborted or unacknowledged pin transaction even when Git exits during the abort grace period or before cleanup checks its status. This closes the redirected-background-child leak in 0.1.3. Keep bounded abort and lock cleanup, confirmed committed-pin recovery and acknowledged success behavior unchanged. Regression tests cover graceful abort, early Git exit and successful transaction descendants. Existing jobs, runs, grants and snapshots are not migrated.
