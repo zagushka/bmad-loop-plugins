@@ -1,12 +1,19 @@
 # bmad-loop plugins
 
-An independent collection of versioned plugins for bmad-loop. `delivery` is the first plugin. It delivers an exact source commit through GitHub PRs and records Ticket Tree acceptance after verified merges. It needs factual evidence from an authorized orchestrator.
+An independent collection of versioned plugins for bmad-loop.
+
+| Plugin | Version | Purpose |
+| --- | --- | --- |
+| [delivery](docs/delivery/README.md) | 0.1.0 | Deliver exact source commits through checked GitHub PRs and record Ticket Tree acceptance using orchestrator evidence. |
+| [codex-notify](docs/codex-notify/README.md) | 1.0.0 | Send advisory run/story journal notifications to one existing Codex chat per run. |
 
 Each plugin runtime is in `plugins/<name>/`. Tests, examples, compatibility metadata and documentation are outside that directory. Documentation edits do not change the installed runtime digest.
 
 ## Requirements
 
 The manager uses Python 3.11+ standard libraries and Git on POSIX systems (macOS or Linux). Delivery is tested with bmad-loop **0.13.2 / plugin API 1**, macOS, Node **22**, pnpm **10.17.1**, `gh`, and native repo-local BMad Ticket Tree projects. It uses the target project's cached loop executable at `.bmad-loop/cache/bin/bmad-loop`, or `bmad-loop` on PATH. Other loop versions are refused until tested and added to the release metadata.
+
+Codex Notify is also tested with bmad-loop **0.13.2 / API 1**. It requires Python 3.11+, POSIX and a Codex CLI with `codex queue`; it does not require Node or pnpm. Messages have one attempt and may be lost or reordered. Configure a destination only for an authorized new run, following the [plugin guide](docs/codex-notify/README.md).
 
 The manager must run while the target project's loop and workers are stopped. Installation does not hot reload running workers. Existing workers keep their content snapshots. Migrating running projects is a separate operator action.
 
@@ -21,9 +28,17 @@ python3 -B manage.py install delivery --version 0.1.0 --project /absolute/projec
 python3 -B manage.py status --project /absolute/project
 ```
 
-The runtime payload contains code, manifest and its MIT license notice. Only files under `plugins/delivery/` in the exact `delivery-v0.1.0` Git tag are installed. Uncommitted collection changes are not an installation source. Tags must come from this trusted collection. The manager does not fetch or use an automatic latest version.
+Install Codex Notify independently, or alongside delivery:
 
-The default destination is `<project>/.bmad-loop/plugins/delivery`. The manager records name, version, tag, exact commit, deterministic content digest and digest algorithm in `.bmad-loop/plugins.lock.json`. The digest is compatible with bmad-loop's tree digest v1: sorted relative paths, SHA256 of raw bytes, and executable flags; bytecode caches are excluded. The lock is an installation record, not a content grant or signature.
+```sh
+python3 -B manage.py install codex-notify --version 1.0.0 --project /absolute/project
+```
+
+Each plugin has its own release tag and lock entry. Updating one preserves the other. Keep the destination chat and Codex executable in run environment or policy settings, outside the installed payload.
+
+The runtime payload contains code, manifest and its MIT license notice. Only files under `plugins/<name>/` in the exact `<name>-v<version>` Git tag are installed. Uncommitted collection changes are not an installation source. Tags must come from this trusted collection. The manager does not fetch or use an automatic latest version.
+
+The default destination is `<project>/.bmad-loop/plugins/<name>`. The manager records name, version, tag, exact commit, deterministic content digest and digest algorithm in `.bmad-loop/plugins.lock.json`. The digest is compatible with bmad-loop's tree digest v1: sorted relative paths, SHA256 of raw bytes, and executable flags; bytecode caches are excluded. The lock is an installation record, not a content grant or signature.
 
 The loop runtime is normally ignored. Keep it ignored; track only the manager lock if your project needs a reproducible record:
 
