@@ -80,6 +80,40 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(self.tx.exists())
 
+    def test_real_plugins_install_and_update_independently(self):
+        m.git('tag', 'codex-notify-v1.0.0')
+        self.change()
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.change('install', 'codex-notify', '1.0.0', self.project)
+        notify = self.dest.parent / 'codex-notify'
+        before_tree = m.tree(notify)
+        before_record = json.loads(self.lock.read_text())['plugins']['codex-notify']
+        binding = self.project / '.bmad-loop/runs/fixture/codex-notify/state.json'
+        binding.parent.mkdir(parents=True)
+        binding.write_text('{"binding":"fixture-only"}')
+        self.tag('0.1.1')
+        self.change('0.1.1', 'update')
+        self.assertEqual(m.tree(notify), before_tree)
+        self.assertEqual(json.loads(self.lock.read_text())['plugins']['codex-notify'], before_record)
+        self.assertEqual(binding.read_text(), '{"binding":"fixture-only"}')
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            m.status(self.project)
+        self.assertIn('codex-notify 1.0.0: clean', output.getvalue())
+        self.assertIn('delivery 0.1.1: clean', output.getvalue())
+        delivery_tree = m.tree(self.dest)
+        delivery_record = json.loads(self.lock.read_text())['plugins']['delivery']
+        manifest = self.collection / 'plugins/codex-notify/plugin.toml'
+        manifest.write_text(manifest.read_text().replace('version = "1.0.0"', 'version = "1.0.1"'))
+        m.git('add', '.')
+        m.git('commit', '-m', 'notify fixture release')
+        m.git('tag', 'codex-notify-v1.0.1')
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.change('update', 'codex-notify', '1.0.1', self.project)
+        self.assertEqual(m.tree(self.dest), delivery_tree)
+        self.assertEqual(json.loads(self.lock.read_text())['plugins']['delivery'], delivery_record)
+        self.assertEqual(binding.read_text(), '{"binding":"fixture-only"}')
+        self.assertEqual(json.loads(self.lock.read_text())['plugins']['codex-notify']['version'], '1.0.1')
+
     def test_update_and_rollback_show_diff_preserve_config_other_plugins(self):
         self.change()
         private = self.project / 'private.json'
