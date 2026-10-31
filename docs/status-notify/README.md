@@ -8,16 +8,13 @@ reads are required. Python 3.11+, POSIX file locks (macOS or Linux), and bmad-lo
 
 ## Release and installation
 
-The working tree prepares version 1.1.0 (unreleased). The `journal_events`
-setting below requires 1.1.0; it is not available in the released 1.0.0 payload.
-Do not install this working tree or use a 1.1.0 tag until that release is reviewed
-and published.
+`journal_events` is available from version 1.1.0.
 
-Install version 1.0.0 from the reviewed `status-notify-v1.0.0` tag, not from
+Install version 1.1.0 from the reviewed `status-notify-v1.1.0` tag, not from
 an uncommitted working tree:
 
 ```sh
-python3 -B manage.py install status-notify --version 1.0.0 --project /absolute/project
+python3 -B manage.py install status-notify --version 1.1.0 --project /absolute/project
 python3 -B manage.py status --project /absolute/project
 ```
 
@@ -37,6 +34,8 @@ sender_command = 'codex queue --thread={destination} --message {message}'
 destination = "existing-chat-uuid"
 # Optional: defaults to all 49 hooks; empty disables hook messages.
 hooks = "*"
+# Optional: defaults to all 22 supported journal notification kinds.
+journal_events = "*"
 ```
 
 Alternatively, set the recipient in the shell that starts the run:
@@ -126,16 +125,16 @@ Only hooks reached on the run's actual path can send messages. `pre_commit_gate`
 is a workflow injection stage, not an emitted plugin hook. `spec-approval` is a
 journal pause stage, not a hook; its journal notification follows the `run-paused`
 journal selection independently of hooks. Worktree teardown hooks are adjacent
-before restoration; they do not bracket physical deletion. `post_run` is not emitted on every error, pause
-or hard stop. Use journal messages and status inspection for those cases.
+before restoration; they do not bracket physical deletion. `post_run` is not
+emitted on every error, pause or hard stop. Use journal messages and status inspection for those cases.
 Repeated invocations, including replayed `post_migrate`, may repeat messages;
 `delivery_id` is included when present, but the plugin does not deduplicate
 hooks.
 
-## Select journal notifications (1.1.0, unreleased)
+## Select journal notifications
 
-After upgrading to a reviewed release with this setting, merge it into the
-existing plugin settings:
+To receive only selected journal messages, merge this value into the existing
+plugin settings:
 
 ```toml
 [plugins.status-notify]
@@ -149,17 +148,37 @@ and duplicate handling:
 | Value | Journal messages for a new run |
 | --- | --- |
 | Omitted or `"*"` | All supported journal notifications listed below. |
-| `"run-crash,story-awaiting-operator"` | Only those two event kinds. |
+| A single event name, such as `"run-crash"` | Only that event kind. |
+| Comma-separated event names, such as `"run-crash,story-awaiting-operator"` | Only the listed event kinds. |
 | `""` or whitespace | No journal messages. Hook messages follow `hooks`. |
 
-| Area | Selectable journal event kinds |
+Any combination of the following 22 names is accepted. Use exact lowercase
+names; spaces around names are allowed and duplicates count once.
+
+| Event name | Message or condition |
 | --- | --- |
-| Run | `run-start`, `run-paused`, `run-resume`, `run-stop`, `run-complete`, `run-crash` |
-| Story | `story-start`, `story-escalated`, `story-awaiting-operator`, `story-done`, `story-deferred`, `story-skipped` |
-| Recovery procedure | `resume-verify`, `resume-review`, `resume-commit`, `resume-defer` |
-| Interrupted session restart | `session-start` |
-| Permission | `session-parked`, `parked-answered`, `session-unparked` |
-| Quota | `quota-wait-started`, `quota-wait-ended` |
+| `run-start` | Run started. |
+| `run-paused` | Run paused; includes the paused story when its key is present. |
+| `run-resume` | Run resume procedure started. |
+| `run-stop` | Run stopped. |
+| `run-complete` | Run completed. |
+| `run-crash` | Run crashed. |
+| `story-start` | Story started. |
+| `story-escalated` | Story escalated. |
+| `story-awaiting-operator` | Story awaiting operator. |
+| `story-done` | Story done. |
+| `story-deferred` | Story deferred. |
+| `story-skipped` | Story skipped. |
+| `resume-verify` | Story verification procedure started; includes dev/review role when known. |
+| `resume-review` | Story review procedure started. |
+| `resume-commit` | Story commit procedure started. |
+| `resume-defer` | Story deferral procedure started. |
+| `session-start` | Session restarting for a previously interrupted story; ordinary session starts are silent. |
+| `session-parked` | Tracked story session waiting for permission; repeated wait records are silent. |
+| `parked-answered` | Permission answer sent for an open wait; session activity is not confirmed. |
+| `session-unparked` | Activity detected after a permission wait, only with `how=activity`; other endings only close the wait. |
+| `quota-wait-started` | Tracked story session waiting for quota; repeated wait records are silent. |
+| `quota-wait-ended` | Quota wait ended; activity is confirmed only with `how=transcript-active`. |
 
 Selection does not add messages: `session-start` sends only for an interrupted
 story restart, and wait messages still require the tracked session and state
@@ -248,8 +267,8 @@ in reasons. Local state holds only the binding, reducer state and cursor;
 diagnostics omit event text.
 
 Each selected journal notification has one delivery attempt. The observer saves
-and syncs its cursor and mapping state **before** it launches the sender. A crash between
-those steps can lose a message. Failed delivery is never retried. Successful
+and syncs its cursor and mapping state **before** it launches the sender. A crash
+between those steps can lose a message. Failed delivery is never retried. Successful
 sender exit does not prove that the destination chat read or acted on the
 message. Delivery order can differ from journal order because senders run
 independently. Hook messages also have one attempt per invocation, with no
@@ -307,8 +326,8 @@ use disposable runs and fake senders, not real recipients or content grants.
 
 ## Verification scope
 
-The runtime uses a journal reducer, hook and journal selection, privacy filters, journal
-integrity checks and sender failure isolation. It sends messages through an
+The runtime uses a journal reducer, hook and journal selection, privacy filters,
+journal integrity checks and sender failure isolation. It sends messages through an
 explicit command. Controlled sender and HookBus tests do
 not establish receipt by Codex or any other recipient, or execution of every
 conditional engine path. Compatibility is limited to the tested Loop version.
