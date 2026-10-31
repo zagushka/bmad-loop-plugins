@@ -35,6 +35,10 @@ class ManagerTest(unittest.TestCase):
         m.git('config', 'user.email', 'test@example.invalid')
         shutil.copytree(ROOT / 'plugins', self.collection / 'plugins')
         shutil.copytree(ROOT / 'compatibility', self.collection / 'compatibility')
+        notify_manifest = self.collection / 'plugins/codex-notify/plugin.toml'
+        import re
+        notify_manifest.write_text(re.sub(r'version = "\d+\.\d+\.\d+"',
+                                          'version = "1.0.0"', notify_manifest.read_text()))
         self.tag('0.1.0')
         self.loop = self.project / '.bmad-loop/cache/bin/bmad-loop'
         self.loop.parent.mkdir(parents=True)
