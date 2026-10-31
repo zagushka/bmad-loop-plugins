@@ -237,7 +237,7 @@ and manifest without byte changes. Version 1.1.0 extends that
 implementation with the SDK bridge and hook selection. In the source chat, live
 receipt was confirmed for `run-start`, `run-paused` and `run-complete` using the
 real engine with a test adapter. That test did not establish full CLI launch
-acceptance; `run-resume` delivery was not separately verified. Candidate tests
+acceptance; `run-resume` delivery was not separately verified. Tests
 use fake senders and do not repeat live sends. The 49-hook list comes from
 runtime source inspection; synthetic HookBus dispatch does not prove that all
 conditional engine paths ran.
