@@ -8,11 +8,13 @@ reads are required. Python 3.11+, POSIX file locks (macOS or Linux), and bmad-lo
 
 ## Release and installation
 
-Install version 1.0.0 from the reviewed `status-notify-v1.0.0` tag, not from
+`journal_events` is available from version 1.1.0.
+
+Install version 1.1.0 from the reviewed `status-notify-v1.1.0` tag, not from
 an uncommitted working tree:
 
 ```sh
-python3 -B manage.py install status-notify --version 1.0.0 --project /absolute/project
+python3 -B manage.py install status-notify --version 1.1.0 --project /absolute/project
 python3 -B manage.py status --project /absolute/project
 ```
 
@@ -30,8 +32,10 @@ unrelated values:
 [plugins.status-notify]
 sender_command = 'codex queue --thread={destination} --message {message}'
 destination = "existing-chat-uuid"
-# Optional: defaults to all 49 hooks; empty means journal messages only.
+# Optional: defaults to all 49 hooks; empty disables hook messages.
 hooks = "*"
+# Optional: defaults to all 22 supported journal notification kinds.
+journal_events = "*"
 ```
 
 Alternatively, set the recipient in the shell that starts the run:
@@ -46,7 +50,8 @@ without either, no observer or binding is created. There is no sender-command
 environment override.
 
 The Loop SDK exposes resolved settings as `BMAD_LOOP_SETTING_SENDER_COMMAND`,
-`BMAD_LOOP_SETTING_DESTINATION` and `BMAD_LOOP_SETTING_HOOKS`. The Loop supplies
+`BMAD_LOOP_SETTING_DESTINATION`, `BMAD_LOOP_SETTING_HOOKS` and
+`BMAD_LOOP_SETTING_JOURNAL_EVENTS`. The Loop supplies
 run identity and paths. Do not point these at another run.
 
 The command uses POSIX quoting, parsed with `shlex.split()` **before** data is
@@ -69,7 +74,7 @@ placeholders leave the new run inactive, with advisory diagnostics that do not
 echo the command, recipient or message.
 
 The first successful binding save freezes the parsed sender arguments, destination
-and hook selection in the run's `status-notify/state.json`. Later hooks and
+and both event selections in the run's `status-notify/state.json`. Later hooks and
 observer restarts use that saved binding. Use a new run to change the sender,
 recipient or selection. Existing run state is not migrated automatically.
 
@@ -88,7 +93,7 @@ duplicates count once:
 | --- | --- |
 | Omitted or `"*"` | All 49 hooks listed below. |
 | `"pre_commit,post_story"` | Only those two hook invocations. |
-| `""` or whitespace | No hook messages. Journal messages remain active. |
+| `""` or whitespace | No hook messages. Journal messages follow `journal_events`. |
 
 An unknown name, empty item, `"*,pre_commit"`, or non-string value is invalid.
 The plugin does not create a new binding or start notifications for an invalid
@@ -96,9 +101,9 @@ selection. Loop work is not vetoed. Diagnostic text does not echo the input.
 There is no hook-selection environment override. The SDK supplies resolved settings.
 
 Selection is fixed when a new run first saves its binding. Later policy or
-environment changes do not change that run. Use `hooks = ""` for journal-only
-notifications. The default `"*"` sends all selected hook invocations in addition
-to journal events.
+environment changes do not change that run. Use `hooks = ""` with a nonempty
+`journal_events` selection for journal-only notifications. The default `"*"`
+sends all selected hook invocations in addition to selected journal events.
 
 The following set comes from source inspection of installed 0.13.2/API 1:
 
@@ -118,13 +123,91 @@ The following set comes from source inspection of installed 0.13.2/API 1:
 A hook message means **the hook was invoked**, not that its operation succeeded.
 Only hooks reached on the run's actual path can send messages. `pre_commit_gate`
 is a workflow injection stage, not an emitted plugin hook. `spec-approval` is a
-journal pause stage, not a hook; its journal notification remains active for any
-hook selection. Worktree teardown hooks are adjacent before restoration; they do
-not bracket physical deletion. `post_run` is not emitted on every error, pause
-or hard stop. Use journal messages and status inspection for those cases.
+journal pause stage, not a hook; its journal notification follows the `run-paused`
+journal selection independently of hooks. Worktree teardown hooks are adjacent
+before restoration; they do not bracket physical deletion. `post_run` is not
+emitted on every error, pause or hard stop. Use journal messages and status inspection for those cases.
 Repeated invocations, including replayed `post_migrate`, may repeat messages;
 `delivery_id` is included when present, but the plugin does not deduplicate
 hooks.
+
+## Select journal notifications
+
+To receive only selected journal messages, merge this value into the existing
+plugin settings:
+
+```toml
+[plugins.status-notify]
+journal_events = "run-crash,story-awaiting-operator"
+```
+
+`journal_events` selects messages by the exact journal `kind`. It is independent
+of `hooks` and uses the same string syntax, case sensitivity, whitespace handling
+and duplicate handling:
+
+| Value | Journal messages for a new run |
+| --- | --- |
+| Omitted or `"*"` | All supported journal notifications listed below. |
+| A single event name, such as `"run-crash"` | Only that event kind. |
+| Comma-separated event names, such as `"run-crash,story-awaiting-operator"` | Only the listed event kinds. |
+| `""` or whitespace | No journal messages. Hook messages follow `hooks`. |
+
+Any combination of the following 22 names is accepted. Use exact lowercase
+names; spaces around names are allowed and duplicates count once.
+
+| Event name | Message or condition |
+| --- | --- |
+| `run-start` | Run started. |
+| `run-paused` | Run paused; includes the paused story when its key is present. |
+| `run-resume` | Run resume procedure started. |
+| `run-stop` | Run stopped. |
+| `run-complete` | Run completed. |
+| `run-crash` | Run crashed. |
+| `story-start` | Story started. |
+| `story-escalated` | Story escalated. |
+| `story-awaiting-operator` | Story awaiting operator. |
+| `story-done` | Story done. |
+| `story-deferred` | Story deferred. |
+| `story-skipped` | Story skipped. |
+| `resume-verify` | Story verification procedure started; includes dev/review role when known. |
+| `resume-review` | Story review procedure started. |
+| `resume-commit` | Story commit procedure started. |
+| `resume-defer` | Story deferral procedure started. |
+| `session-start` | Session restarting for a previously interrupted story; ordinary session starts are silent. |
+| `session-parked` | Tracked story session waiting for permission; repeated wait records are silent. |
+| `parked-answered` | Permission answer sent for an open wait; session activity is not confirmed. |
+| `session-unparked` | Activity detected after a permission wait, only with `how=activity`; other endings only close the wait. |
+| `quota-wait-started` | Tracked story session waiting for quota; repeated wait records are silent. |
+| `quota-wait-ended` | Quota wait ended; activity is confirmed only with `how=transcript-active`. |
+
+Selection does not add messages: `session-start` sends only for an interrupted
+story restart, and wait messages still require the tracked session and state
+described below. `session-end` only updates internal state; it has no message
+and is not selectable. Unknown event kinds, empty list items, mixed wildcard
+lists such as `"*,run-crash"`, and non-string values are invalid. An invalid
+selection leaves a new run without a binding or notifications; Loop work is not
+vetoed and diagnostics do not echo the input. There is no separate environment
+override; the SDK supplies the resolved setting.
+
+Both selections are fixed by the first binding save. Changes need a new run;
+observer restarts keep the saved selection. Existing bindings without
+`journal_events` retain all journal notifications without rewriting the binding.
+The observer still processes every journal record for session state, wait
+tracking, cursor integrity and completion, even when its message is disabled.
+Disabling a wait-start message does not prevent a selected wait-end message.
+
+To disable all notification messages for a new run:
+
+```toml
+[plugins.status-notify]
+hooks = ""
+journal_events = ""
+```
+
+Merge these two values into existing settings. With a configured sender and
+destination, the observer can still run, but neither channel sends a message.
+There is no automatic deduplication between hook and journal messages; select
+the events you need in each channel.
 
 ## Behavior and messages
 
@@ -183,9 +266,9 @@ secret; inspect the target journal if your integrations put unusual credentials
 in reasons. Local state holds only the binding, reducer state and cursor;
 diagnostics omit event text.
 
-Each journal event has one delivery attempt. The observer saves and syncs its
-cursor and mapping state **before** it launches the sender. A crash between
-those steps can lose a message. Failed delivery is never retried. Successful
+Each selected journal notification has one delivery attempt. The observer saves
+and syncs its cursor and mapping state **before** it launches the sender. A crash
+between those steps can lose a message. Failed delivery is never retried. Successful
 sender exit does not prove that the destination chat read or acted on the
 message. Delivery order can differ from journal order because senders run
 independently. Hook messages also have one attempt per invocation, with no
@@ -243,8 +326,8 @@ use disposable runs and fake senders, not real recipients or content grants.
 
 ## Verification scope
 
-The runtime uses a journal reducer, hook selection, privacy filters, journal
-integrity checks and sender failure isolation. It sends messages through an
+The runtime uses a journal reducer, hook and journal selection, privacy filters,
+journal integrity checks and sender failure isolation. It sends messages through an
 explicit command. Controlled sender and HookBus tests do
 not establish receipt by Codex or any other recipient, or execution of every
 conditional engine path. Compatibility is limited to the tested Loop version.

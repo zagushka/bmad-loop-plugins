@@ -1,5 +1,18 @@
 # Status Notify changelog
 
+## 1.1.0 — 2026-10-31
+
+- Add independent `journal_events` selection: `*` (default), comma-separated
+  exact event kinds, or empty for no journal messages. Set both `hooks` and
+  `journal_events` empty to disable all notification messages.
+- Freeze journal selection per run and preserve all notifications for old
+  bindings without the field. Continue journal state tracking for filtered events.
+- Reject invalid journal selections before creating a new binding.
+
+Compatibility: unchanged Python 3.11+, POSIX, bmad-loop 0.13.2 / API 1.
+Install from the immutable `status-notify-v1.1.0` tag. Existing installations
+need a separate update and content review; the 1.0.0 tag remains unchanged.
+
 ## 1.0.0 — 2026-10-31
 
 - Add standalone status-notify with the 49 selectable lifecycle hooks and journal

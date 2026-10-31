@@ -6,7 +6,7 @@ Add notifications or GitHub delivery to your bmad-loop project. Choose the plugi
 
 | Plugin | What it does | Version |
 | --- | --- | --- |
-| [status-notify](docs/status-notify/README.md) | Sends run and story updates, pauses, permission waits and lifecycle events through a command you choose. | 1.0.0 |
+| [status-notify](docs/status-notify/README.md) | Sends run and story updates, pauses, permission waits and lifecycle events through a command you choose. | 1.1.0 |
 | [delivery](docs/delivery/README.md) | Opens GitHub pull requests for completed work, checks review and acceptance evidence, and records Ticket Tree completion after the required merges. | 0.2.0 |
 
 Use **status-notify** for progress messages. You supply the sender command and destination. Messages can be lost or arrive out of order; they do not control the run.
@@ -34,7 +34,7 @@ cd bmad-loop-plugins
 Replace `/absolute/project` with the full path to your bmad-loop project. Run the command for the plugin you chose, or run both:
 
 ```sh
-python3 -B manage.py install status-notify --version 1.0.0 --project /absolute/project
+python3 -B manage.py install status-notify --version 1.1.0 --project /absolute/project
 ```
 
 ```sh
@@ -66,7 +66,7 @@ With the loop and workers stopped, fetch release tags and select a released vers
 
 ```sh
 git fetch origin --tags
-python3 -B manage.py update status-notify --version 1.0.0 --project /absolute/project
+python3 -B manage.py update status-notify --version 1.1.0 --project /absolute/project
 ```
 
 Replace the plugin name and version with the release you want. Review changed code and settings, then run the printed `plugins accept` command. The manager does not overwrite local plugin edits or approve changed code automatically.

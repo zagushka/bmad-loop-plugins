@@ -33,17 +33,28 @@ pre_close_resolved post_close_resolved pre_decision post_decision
 pre_materialize_bundles post_materialize_bundles
 """.split())
 
+JOURNAL_EVENTS = frozenset("""
+run-start run-paused run-resume run-stop run-complete run-crash
+story-start story-escalated story-awaiting-operator story-done story-deferred story-skipped
+resume-verify resume-review resume-commit resume-defer session-start
+session-parked parked-answered session-unparked quota-wait-started quota-wait-ended
+""".split())
+
 
 def selected_hooks(value):
+    return selected_names(value, HOOKS, "hooks")
+
+
+def selected_names(value, allowed, setting):
     if not isinstance(value, str):
-        raise ValueError("hooks must be a string")
+        raise ValueError(f"{setting} must be a string")
     if value.strip() == "*":
-        return sorted(HOOKS)
+        return sorted(allowed)
     if not value.strip():
         return []
     names = [name.strip() for name in value.split(",")]
-    if any(name not in HOOKS for name in names):
-        raise ValueError("unknown hook selection")
+    if any(name not in allowed for name in names):
+        raise ValueError(f"unknown {setting} selection")
     return sorted(set(names))
 
 
@@ -140,7 +151,7 @@ def reduce_event(state, event):
             text = prefix + ("session activity detected after quota wait."
                              if event.get("how") == "transcript-active"
                              else "quota wait ended; activity is not confirmed.")
-    if not text:
+    if not text or kind not in state["binding"].get("journal_events", JOURNAL_EVENTS):
         return None
     binding = state["binding"]
     context = dict(kind=kind, project=binding.get("project", "?"), journal=binding.get("journal", "?"))
@@ -213,7 +224,9 @@ def binding_from_env(run_dir):
                 journal=str(run_dir / "journal.jsonl"), run_id=os.environ.get("BMAD_LOOP_RUN_ID", "?"),
                 destination=os.environ.get("BMAD_STATUS_NOTIFY_DESTINATION") or os.environ.get("BMAD_LOOP_SETTING_DESTINATION", ""),
                 sender_argv=sender_arguments(os.environ.get("BMAD_LOOP_SETTING_SENDER_COMMAND", "")),
-                hooks=selected_hooks(os.environ.get("BMAD_LOOP_SETTING_HOOKS", "*")))
+                hooks=selected_hooks(os.environ.get("BMAD_LOOP_SETTING_HOOKS", "*")),
+                journal_events=selected_names(os.environ.get("BMAD_LOOP_SETTING_JOURNAL_EVENTS", "*"),
+                                              JOURNAL_EVENTS, "journal_events"))
 
 
 def launch(run_dir):

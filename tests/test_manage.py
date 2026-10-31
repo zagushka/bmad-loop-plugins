@@ -9,6 +9,7 @@ import shutil
 import shlex
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -35,6 +36,10 @@ class ManagerTest(unittest.TestCase):
         m.git('config', 'user.email', 'test@example.invalid')
         shutil.copytree(ROOT / 'plugins', self.collection / 'plugins')
         shutil.copytree(ROOT / 'compatibility', self.collection / 'compatibility')
+        manifest = self.collection / 'plugins/status-notify/plugin.toml'
+        text = manifest.read_text()
+        version = tomllib.loads(text)['plugin']['version']
+        manifest.write_text(text.replace(f'version = "{version}"', 'version = "1.0.0"'))
         legacy = self.collection / 'plugins/legacy-notify'
         shutil.copytree(self.collection / 'plugins/status-notify', legacy)
         manifest = legacy / 'plugin.toml'
