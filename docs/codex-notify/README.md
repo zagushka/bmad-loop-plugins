@@ -7,20 +7,19 @@ does not change the application or bmad-loop core.
 Requires Python 3.11+, POSIX file locks (macOS or Linux), bmad-loop's plugin API
 v1 (tested with 0.13.2), and a Codex CLI with `codex queue`.
 
-## Source candidate
+## Version 1.1.0
 
-Version **1.1.0 is unreleased**. It adds notifications for all 49 hooks emitted
-by bmad-loop 0.13.2 and a `hooks` setting. The published 1.0.0 install command
-below installs the journal-only version. Do not install this candidate from a
-working tree or grant changed code without a separate review and authorized
-update.
+Version 1.1.0 adds notifications for all 49 hooks emitted by bmad-loop 0.13.2
+and a `hooks` setting. Review the changed code and settings before updating
+between runs. Existing 1.0.0 bindings remain journal-only. Installation and
+content grants are separate steps.
 
 ## Install and grant
 
 Use the collection manager from its clone:
 
 ```sh
-python3 -B manage.py install codex-notify --version 1.0.0 --project /absolute/project
+python3 -B manage.py install codex-notify --version 1.1.0 --project /absolute/project
 python3 -B manage.py status --project /absolute/project
 ```
 
@@ -234,7 +233,7 @@ fake Codex executables; they send no live messages and grant no real plugin.
 The source implementation was merged in [PR
 #130](https://github.com/zagushka/bdays-extractor-saas/pull/130), commit
 `cf73d4a775431b35b4afc7bb0f9ae53d0a12785a`. Version 1.0.0 extracted the runtime
-and manifest without byte changes. The 1.1.0 candidate extends that
+and manifest without byte changes. Version 1.1.0 extends that
 implementation with the SDK bridge and hook selection. In the source chat, live
 receipt was confirmed for `run-start`, `run-paused` and `run-complete` using the
 real engine with a test adapter. That test did not establish full CLI launch

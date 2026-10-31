@@ -5,7 +5,7 @@ An independent collection of versioned plugins for bmad-loop.
 | Plugin | Version | Purpose |
 | --- | --- | --- |
 | [delivery](docs/delivery/README.md) | 0.2.0 | Deliver exact source commits through checked GitHub PRs and record Ticket Tree acceptance using orchestrator evidence. |
-| [codex-notify](docs/codex-notify/README.md) | 1.0.0 released; 1.1.0 candidate | Send advisory lifecycle hook and journal notifications to one existing Codex chat per run. |
+| [codex-notify](docs/codex-notify/README.md) | 1.1.0 | Send advisory lifecycle hook and journal notifications to one existing Codex chat per run. |
 
 Each plugin runtime is in `plugins/<name>/`. Tests, examples, compatibility metadata and documentation are outside that directory. Documentation edits do not change the installed runtime digest.
 
@@ -15,9 +15,9 @@ The manager uses Python 3.11+ standard libraries and Git on POSIX systems (macOS
 
 Codex Notify is also tested with bmad-loop **0.13.2 / API 1**. It requires Python 3.11+, POSIX and a Codex CLI with `codex queue`; it does not require Node or pnpm. Messages have one attempt and may be lost or reordered. Configure a destination only for an authorized new run, following the [plugin guide](docs/codex-notify/README.md).
 
-The unreleased Codex Notify 1.1.0 source candidate adds all 49 installed-runtime
-hooks and a per-run `hooks` selection. Published 1.0.0 remains journal-only. See
-the plugin guide for defaults and compatibility; use only published tags to install.
+Codex Notify 1.1.0 supports all 49 installed-runtime hooks and a per-run `hooks`
+selection. Existing 1.0.0 bindings remain journal-only. See the plugin guide for
+defaults and compatibility; use only published tags to install.
 
 The manager must run while the target project's loop and workers are stopped. Installation does not hot reload running workers. Existing workers keep their content snapshots. Migrating running projects is a separate operator action.
 
@@ -35,7 +35,7 @@ python3 -B manage.py status --project /absolute/project
 Install Codex Notify independently, or alongside delivery:
 
 ```sh
-python3 -B manage.py install codex-notify --version 1.0.0 --project /absolute/project
+python3 -B manage.py install codex-notify --version 1.1.0 --project /absolute/project
 ```
 
 Each plugin has its own release tag and lock entry. Updating one preserves the other. Keep the destination chat and Codex executable in run environment or policy settings, outside the installed payload.

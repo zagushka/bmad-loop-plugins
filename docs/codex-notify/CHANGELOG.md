@@ -1,6 +1,6 @@
 # Codex Notify changelog
 
-## 1.1.0 (unreleased)
+## 1.1.0 — 2026-10-31
 
 - Add an API-1 bridge for all 49 lifecycle hooks emitted by bmad-loop 0.13.2,
   including role-specific sessions, commit, integration, rollback and sweep.
@@ -11,7 +11,7 @@
 - Send hook invocation messages through detached processes with the existing
   bounded sender. Keep exact dispatch/context fields, privacy limits, journal
   pauses such as spec-approval, and failure isolation. No Loop changes, live
-  notifications, activation, trust changes or publication are part of this change.
+  notifications, activation or trust changes are part of this release.
 
 ## 1.0.0
 
