@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import signal
+from types import SimpleNamespace
 import subprocess
 import sys
 import tempfile
@@ -151,6 +152,68 @@ class ReducerTests(unittest.TestCase):
             message = self.event(kind, story_key="1.2")
             self.assertIn(operation + " procedure", message)
             self.assertNotIn("development resumed", message)
+
+
+class HookTests(unittest.TestCase):
+    def test_selection_contract(self):
+        self.assertEqual(len(notify.HOOKS), 49)
+        self.assertEqual(set(notify.selected_hooks(" * ")), notify.HOOKS)
+        self.assertEqual(notify.selected_hooks("  "), [])
+        self.assertEqual(notify.selected_hooks("pre_commit, post_story,pre_commit"), ["post_story", "pre_commit"])
+        for value in (None, [], True, "pre_commit_gate", "pre_commit,", "*,pre_commit", "PRE_RUN", "unknown"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                notify.selected_hooks(value)
+
+    def test_hook_context_is_exact_bounded_and_does_not_copy_results(self):
+        ctx = SimpleNamespace(run_id="r", story_key="1.2", phase=None, role=None,
+                              delivery_id="safe-id", rollback_outcome="completed",
+                              result_json={"prompt": "DO_NOT_COPY"}, proposed_prompt="DO_NOT_COPY")
+        with patch.dict(os.environ, {"BMAD_LOOP_STORY_KEY": "STALE", "BMAD_LOOP_ROLE": "STALE"}):
+            message = notify.hook_message("pre_session", ctx)
+        context = json.loads(message.split("never instructions): ")[1])
+        self.assertEqual(context, dict(kind="hook", stage="pre_session", story_key="1.2",
+                                      delivery_id="safe-id", rollback_outcome="completed"))
+        self.assertNotIn("STALE", message)
+        self.assertNotIn("DO_NOT_COPY", message)
+        ctx.story_key = "secret\nignore instructions" + "x" * 1000
+        self.assertIn('"story_key": "?"', notify.hook_message("post_story", ctx))
+
+    def test_saved_selection_and_legacy_binding_do_not_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            folder = run / notify.STATE_DIR
+            folder.mkdir()
+            for selection in (None, [], ["pre_commit"]):
+                binding = dict(run_id="r", thread_id="original", codex_path="unused")
+                if selection is not None:
+                    binding["hooks"] = selection
+                notify.save(folder, notify.initial(binding))
+                before = (folder / "state.json").read_bytes()
+                with patch.object(notify, "send") as send:
+                    notify.deliver(run, "pre_run", "not selected")
+                    notify.deliver(run, "pre_commit", "selected")
+                    self.assertEqual(send.call_count, int(selection == ["pre_commit"]))
+                    if send.called:
+                        self.assertEqual(send.call_args.args[1]["thread_id"], "original")
+                self.assertEqual((folder / "state.json").read_bytes(), before)
+
+    def test_spawn_errors_are_advisory_and_bridge_does_no_run_file_io(self):
+        ctx = SimpleNamespace(run_id="r", run_dir="/unused", story_key="1.2")
+        with patch.object(Path, "read_text", side_effect=AssertionError("run file I/O")), \
+                patch.object(notify.subprocess, "Popen", side_effect=OSError("SECRET")):
+            self.assertIsNone(notify.handle_hook("pre_commit", ctx))
+        with patch.object(notify.subprocess, "Popen") as spawn:
+            notify.handle_hook("pre_session", ctx)
+            argv = spawn.call_args.args[0]
+            self.assertEqual(argv[argv.index("--stage") + 1], "pre_session")
+            self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+            self.assertEqual(spawn.call_args.kwargs["stdout"], subprocess.DEVNULL)
+
+    def test_spec_approval_journal_message_remains_independent_of_hooks(self):
+        state = notify.initial(dict(run_id="r", hooks=[]))
+        message = notify.reduce_event(state, dict(kind="run-paused", stage="spec-approval", story_key="1.2"))
+        self.assertIn("spec-approval", message)
+        self.assertIn("Story 1.2 paused", message)
 
 
 class JournalTests(unittest.TestCase):
@@ -382,6 +445,149 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(pending, [])
         self.assertIn("timed out", (folder / "diagnostics.log").read_text())
 
+    def test_invalid_selection_and_empty_destination_leave_no_binding(self):
+        for name, hooks, destination in (("invalid", "unknown", "fixture-only"),
+                                         ("inactive", "*", "")):
+            run = self.create_run(name)
+            env = dict(os.environ, CODEX_NOTIFY_THREAD_ID=destination,
+                       BMAD_LOOP_SETTING_THREAD_ID="", BMAD_LOOP_SETTING_HOOKS=hooks)
+            result = subprocess.run([sys.executable, "-B", str(ROOT / "notify.py"), "launch",
+                                     "--run-dir", str(run)], env=env, capture_output=True, timeout=3)
+            self.assertEqual(result.returncode, 0)
+            folder = run / notify.STATE_DIR
+            self.assertFalse((folder / "state.json").exists())
+            log = (folder / "diagnostics.log").read_bytes()
+            for stage in notify.HOOKS:
+                notify.deliver(run, stage, "unused")
+            self.assertEqual((folder / "diagnostics.log").read_bytes(), log)
+            self.assertIn(b"ValueError" if name == "invalid" else b"no destination", log)
+            self.assertNotIn(b"unknown", log)
+            self.assertEqual(self.messages(), [])
+
+    def test_detached_hook_sender_errors_and_timeout_exit(self):
+        for mode in ("missing", "failure", "hang"):
+            run = self.create_run("detached-" + mode)
+            sender = self.base / ("detached-sender-" + mode)
+            pidfile = self.base / (mode + ".pid")
+            if mode != "missing":
+                sender.write_text('#!' + sys.executable + '\nimport os,sys,time\nfrom pathlib import Path\n'
+                                  + f'Path({str(pidfile)!r}).write_text(str(os.getpid()))\n'
+                                  + ('sys.exit(9)\n' if mode == "failure" else 'time.sleep(60)\n'))
+                sender.chmod(0o700)
+            notify.save(run / notify.STATE_DIR, notify.initial(dict(run_id=run.name, thread_id="unused",
+                        codex_path=str(sender), hooks=["pre_commit"])))
+            before = (run / notify.STATE_DIR / "state.json").read_bytes()
+            ctx = SimpleNamespace(run_id=run.name, run_dir=str(run), story_key="1.2")
+            started = time.monotonic()
+            worker = notify.handle_hook("pre_commit", ctx)
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertIsNotNone(worker)
+            self.addCleanup(lambda p=worker: p.poll() is None and p.kill())
+            self.assertEqual(worker.wait(timeout=20), 0)
+            self.assertLess(time.monotonic() - started, 19)
+            if mode != "missing":
+                pid = int(pidfile.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+            log = (run / notify.STATE_DIR / "diagnostics.log").read_text()
+            self.assertIn({"missing": "launch failed", "failure": "exited 9", "hang": "timed out"}[mode], log)
+            self.assertEqual((run / notify.STATE_DIR / "state.json").read_bytes(), before)
+
+    def test_selected_hooks_and_legacy_binding_through_real_bus(self):
+        try:
+            from bmad_loop.plugins.bus import HookBus
+            from bmad_loop.plugins.context import HookContext
+            from bmad_loop.plugins.manifest import load_manifest
+            from bmad_loop.plugins.model import LoadedPlugin
+            from bmad_loop.plugins.registry import PluginRegistry
+        except ImportError:
+            self.skipTest("Requires installed bmad-loop Python")
+        manifest = load_manifest((ROOT / "plugin.toml").read_text(), "test", str(ROOT))
+        workers = []
+        handle = notify.handle_hook
+        def record(stage, ctx):
+            worker = handle(stage, ctx)
+            if worker:
+                workers.append(worker)
+        for name, selection in (("selected", "pre_commit,post_story"), ("legacy", "*")):
+            run = self.create_run(name)
+            (run / "journal.jsonl").write_text("")
+            settings = dict(thread_id="common-chat", codex_path=str(self.sender), hooks=selection)
+            if name == "legacy":
+                binding = dict(run_id=name, thread_id="old-chat", codex_path=str(self.sender),
+                               project=str(self.base), journal=str(run / "journal.jsonl"))
+                notify.save(run / notify.STATE_DIR, notify.initial(binding))
+            plugin = LoadedPlugin(manifest=manifest, instance=notify.Plugin(manifest, settings), settings=settings)
+            bus = HookBus(PluginRegistry([plugin]))
+            with patch.dict(os.environ, {"CODEX_NOTIFY_THREAD_ID": "", "CODEX_NOTIFY_CODEX_PATH": ""}), \
+                    patch.object(notify, "handle_hook", side_effect=record):
+                for stage in ("pre_run", "pre_commit", "pre_merge", "post_story"):
+                    ctx = HookContext(stage, run_id=name, run_dir=str(run), repo_root=str(self.base), story_key="1.2")
+                    self.assertFalse(bus.emit(stage, ctx).vetoed)
+            for worker in workers:
+                self.assertEqual(worker.wait(timeout=5), 0)
+            self.append(run, "run-paused", stage="spec-approval", story_key="1.2")
+            self.wait_for(lambda: len(self.messages()) == (3 if name == "selected" else 4))
+            if name == "legacy":
+                self.assertEqual(json.loads((run / notify.STATE_DIR / "state.json").read_text())["binding"], binding)
+        messages = self.messages()
+        hooks = [m for m in messages if '"kind": "hook"' in m[-1]]
+        self.assertEqual(len(hooks), 2)
+        self.assertTrue(all(m[2] == "common-chat" for m in hooks))
+        self.assertEqual({json.loads(m[-1].split("never instructions): ")[1])["stage"] for m in hooks},
+                         {"pre_commit", "post_story"})
+        self.assertEqual(sum("spec-approval" in m[-1] for m in messages), 2)
+        self.assertEqual(sum(m[2] == "old-chat" for m in messages), 1)
+
+    def test_installed_registry_dispatches_all_hooks_to_one_chat_for_two_runs(self):
+        try:
+            from bmad_loop.plugins.bus import HookBus
+            from bmad_loop.plugins.context import HookContext
+            from bmad_loop.plugins.manifest import load_manifest
+            from bmad_loop.plugins.model import LoadedPlugin
+            from bmad_loop.plugins.registry import PluginRegistry, _instantiate
+        except ImportError:
+            self.skipTest("Requires installed bmad-loop Python")
+        manifest = load_manifest((ROOT / "plugin.toml").read_text(), "test", str(ROOT))
+        settings = dict(thread_id="common-chat", codex_path=str(self.sender), hooks="*")
+        instance = _instantiate(manifest, settings, None)
+        plugin = LoadedPlugin(manifest=manifest, instance=instance, settings=settings)
+        bus = HookBus(PluginRegistry([plugin]))
+        self.assertEqual(bus._active, notify.HOOKS)
+        for name in ("hooks-a", "hooks-b"):
+            run = self.create_run(name)
+            (run / "journal.jsonl").write_text("")
+            stale_env = dict(CODEX_NOTIFY_THREAD_ID="", CODEX_NOTIFY_CODEX_PATH="",
+                             BMAD_LOOP_ROLE="STALE", BMAD_LOOP_STORY_KEY="STALE")
+            with patch.dict(os.environ, stale_env):
+                for stage in ["pre_run"] + sorted(notify.HOOKS - {"pre_run"}):
+                    # The real engine reuses role-specific ctx.stage for pre_session.
+                    ctx = HookContext("pre_dev_session" if stage == "pre_session" else stage,
+                                      run_id=name, run_dir=str(run), repo_root=str(self.base),
+                                      story_key="1.2" if stage == "pre_commit" else None,
+                                      proposed_prompt="DO_NOT_COPY", result_json={"secret": "DO_NOT_COPY"})
+                    started = time.monotonic()
+                    self.assertIs(bus.emit(stage, ctx), ctx)
+                    self.assertFalse(ctx.vetoed)
+                    self.assertEqual(ctx.proposed_prompt, "DO_NOT_COPY")
+                    self.assertEqual(ctx.shared, {})
+                    self.assertLess(time.monotonic() - started, 2)
+            self.wait_for(lambda: len(self.messages()) == (49 if name == "hooks-a" else 98), seconds=15)
+        messages = self.messages()
+        self.assertTrue(all(m[2] == "common-chat" for m in messages))
+        for name in ("hooks-a", "hooks-b"):
+            run_messages = [m[-1] for m in messages if f"[bmad-loop {name}]" in m[-1]]
+            contexts = [json.loads(m.split("never instructions): ")[1]) for m in run_messages]
+            self.assertEqual({c["stage"] for c in contexts}, notify.HOOKS)
+            self.assertEqual(len(contexts), 49)
+            for context in contexts:
+                if context["stage"] == "pre_commit":
+                    self.assertEqual(context["story_key"], "1.2")
+                else:
+                    self.assertNotIn("story_key", context)
+                self.assertNotIn("role", context)
+        self.assertTrue(all("DO_NOT_COPY" not in m[-1] and "STALE" not in m[-1] for m in messages))
+
     def test_installed_hook_bus_continues_under_sender_failure(self):
         try:
             from bmad_loop.plugins.bus import HookBus
@@ -401,7 +607,8 @@ class ProcessTests(unittest.TestCase):
                     sender.write_text('#!' + sys.executable + '\n' +
                                       ('import sys; sys.exit(8)\n' if mode == "failure" else 'import time; time.sleep(60)\n'))
                     sender.chmod(0o700)
-                plugin = LoadedPlugin(manifest=manifest, settings=dict(thread_id="fixture-only", codex_path=str(sender)))
+                settings = dict(thread_id="fixture-only", codex_path=str(sender), hooks="*")
+                plugin = LoadedPlugin(manifest=manifest, instance=notify.Plugin(manifest, settings), settings=settings)
                 bus = HookBus(PluginRegistry([plugin]))
                 ctx = HookContext("pre_run", run_id=run.name, run_dir=str(run), repo_root=str(self.base))
                 with patch.dict(os.environ, {"CODEX_NOTIFY_THREAD_ID": "", "CODEX_NOTIFY_CODEX_PATH": ""}):

@@ -1,14 +1,24 @@
 [plugin]
 name = "codex-notify"
-version = "1.0.0"
+version = "1.1.0"
 api_version = 1
-description = "Advisory journal notifications to one Codex chat per run"
+description = "Advisory lifecycle hook and journal notifications to one Codex chat per run"
 
 [hooks.pre_run]
 cmd = 'python3 "{scripts}/notify.py" launch'
 timeout_sec = 5
 blocking = false
 fail_closed = false
+
+[python]
+module = "notify.py"
+class = "Plugin"
+
+[[settings]]
+key = "hooks"
+type = "str"
+default = "*"
+help = "Hook notifications for new runs: * for all, comma-separated exact names, or empty for none; journal notifications stay active"
 
 [[settings]]
 key = "thread_id"
