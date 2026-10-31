@@ -5,8 +5,8 @@ An independent collection of versioned plugins for bmad-loop.
 | Plugin | Version | Purpose |
 | --- | --- | --- |
 | [delivery](docs/delivery/README.md) | 0.2.0 | Deliver exact source commits through checked GitHub PRs and record Ticket Tree acceptance using orchestrator evidence. |
-| [status-notify](docs/status-notify/README.md) | 1.0.0 (unreleased) | Send run, story and lifecycle status through an explicit sender command. |
-| [codex-notify](docs/codex-notify/README.md) | 1.1.0 (deprecated) | Existing Codex installations; use status-notify for new runs after release. |
+| [status-notify](docs/status-notify/README.md) | 1.0.0 | Send run, story and lifecycle status through an explicit sender command. |
+| [codex-notify](docs/codex-notify/README.md) | 1.1.0 (deprecated) | Existing Codex installations; use status-notify for new runs. |
 
 Each plugin runtime is in `plugins/<name>/`. Tests, examples, compatibility metadata and documentation are outside that directory. Documentation edits do not change the installed runtime digest.
 
@@ -14,7 +14,7 @@ Each plugin runtime is in `plugins/<name>/`. Tests, examples, compatibility meta
 
 The manager uses Python 3.11+ standard libraries and Git on POSIX systems (macOS or Linux). Delivery is tested with bmad-loop **0.13.2 / plugin API 1**, macOS, Node **22**, pnpm **10.17.1**, `gh`, and native repo-local BMad Ticket Tree projects. It uses the target project's cached loop executable at `.bmad-loop/cache/bin/bmad-loop`, or `bmad-loop` on PATH. Other loop versions are refused until tested and added to the release metadata.
 
-Status Notify targets bmad-loop **0.13.2 / API 1**, Python 3.11+ and POSIX. Set
+Status Notify is tested with bmad-loop **0.13.2 / API 1**, Python 3.11+ and POSIX. Set
 an explicit sender command with `{destination}` and `{message}`; no adapter
 configuration or Loop change is required. It does not require Node or pnpm.
 Messages have one attempt and may be lost or reordered. See the
@@ -37,8 +37,7 @@ python3 -B manage.py install delivery --version 0.2.0 --project /absolute/projec
 python3 -B manage.py status --project /absolute/project
 ```
 
-After its reviewed release tag is published, install Status Notify independently,
-or alongside delivery (1.0.0 is currently unreleased):
+Install Status Notify independently, or alongside delivery:
 
 ```sh
 python3 -B manage.py install status-notify --version 1.0.0 --project /absolute/project

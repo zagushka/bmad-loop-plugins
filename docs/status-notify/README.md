@@ -8,9 +8,8 @@ reads are required. Python 3.11+, POSIX file locks (macOS or Linux), and bmad-lo
 
 ## Release and installation
 
-Version 1.0.0 is prepared in source. Install only after the reviewed
-`status-notify-v1.0.0` tag is published; the following command is not an install
-from this working tree:
+Install version 1.0.0 from the reviewed `status-notify-v1.0.0` tag, not from
+an uncommitted working tree:
 
 ```sh
 python3 -B manage.py install status-notify --version 1.0.0 --project /absolute/project
