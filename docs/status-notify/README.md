@@ -42,8 +42,8 @@ export BMAD_STATUS_NOTIFY_DESTINATION='existing-chat-uuid'
 
 A nonempty environment value overrides `destination`. An unset or empty value
 falls back to the setting. Both sender_command and destination default to empty;
-without either, no observer or binding is created. Old `CODEX_NOTIFY_*` variables
-are not read. There is no sender-command environment override.
+without either, no observer or binding is created. There is no sender-command
+environment override.
 
 The Loop SDK exposes resolved settings as `BMAD_LOOP_SETTING_SENDER_COMMAND`,
 `BMAD_LOOP_SETTING_DESTINATION` and `BMAD_LOOP_SETTING_HOOKS`. The Loop supplies
@@ -71,8 +71,7 @@ echo the command, recipient or message.
 The first successful binding save freezes the parsed sender arguments, destination
 and hook selection in the run's `status-notify/state.json`. Later hooks and
 observer restarts use that saved binding. Use a new run to change the sender,
-recipient or selection. The state is separate from `codex-notify` and is not
-migrated automatically.
+recipient or selection. Existing run state is not migrated automatically.
 
 The binding is saved before the observer is launched. If observer launch fails,
 the saved binding remains; a later launch uses it even if settings changed.
@@ -193,9 +192,9 @@ independently. Hook messages also have one attempt per invocation, with no
 persistent queue, retry or replay. A callback/process crash can lose one. Each
 hook invocation starts a short-lived delivery process, even when its saved
 selection is empty. Selected invocations can start concurrent senders; there is
-no global concurrency limit. The all-hooks default increases message volume
-compared with codex-notify 1.0.0. The detached delivery process uses the saved binding and
-the same sender timeout and diagnostics as the observer.
+no global concurrency limit. The all-hooks default can produce many messages.
+The detached delivery process uses the saved binding and the same sender timeout
+and diagnostics as the observer.
 
 The sender uses the parsed argument list, null standard streams and a new
 process session. The observer or detached delivery process polls it without a
@@ -218,47 +217,6 @@ also stops observation. Inspect these conditions manually. The observer checks
 file metadata on each poll and hashes the consumed prefix when that metadata
 changes. Idle polling does not reread the journal. Very large active journals
 can cost more read I/O.
-
-## Transition from deprecated codex-notify
-
-`codex-notify` is deprecated for new runs. Its published versions, tags, installed
-payloads, grants, snapshots and run state remain valid and unchanged.
-
-1. Finish existing runs with their original plugin. Do not enable status-notify
-   for an existing codex-notify run: each observer starts at the beginning and
-   both can send duplicate notifications. Do not copy or edit saved bindings.
-2. Between runs, with loop and workers stopped, install status-notify from its
-   published tag and review its installed bytes and settings.
-3. Copy `thread_id` to `destination`, or replace `CODEX_NOTIFY_THREAD_ID` with
-   `BMAD_STATUS_NOTIFY_DESTINATION`. Use the old `codex_path` (or
-   `CODEX_NOTIFY_CODEX_PATH`) as the executable in the complete command, for example:
-
-   ```toml
-   [plugins.status-notify]
-   sender_command = '"/opt/Agent Tools/codex" queue --thread={destination} --message {message}'
-   destination = "existing-chat-uuid"
-   ```
-
-   Replace the example path with the actual old executable. Preserve
-   the old `hooks` selection; use `""` if journal-only behavior is required.
-4. Disable codex-notify and separately enable/grant status-notify using the
-   target project's Loop executable:
-
-   ```sh
-   bmad-loop plugins disable codex-notify --project /absolute/project
-   bmad-loop plugins enable status-notify --project /absolute/project
-   ```
-
-   Retain unrelated plugin selections. If enabling the new plugin fails, keep
-   the loop stopped and inspect the error before starting a new run. Do not
-   delete the old installation, manager lock entry, state or snapshots.
-5. Start an authorized new run with the selected destination. Changing settings
-   alone does not change old saved bindings or stop already detached observers.
-
-For an abandoned old run, stop its journal observer with the old installed
-script's `stop --run-dir` command before retirement. Stop does not cancel hook
-senders already launched. Retain its state for inspection and do not resume it
-with status-notify. This transition is explicit; installation does not perform it.
 
 ## Stop and test
 
@@ -285,9 +243,9 @@ use disposable runs and fake senders, not real recipients or content grants.
 
 ## Verification scope
 
-The runtime preserves codex-notify 1.1.0's journal reducer, hook selection,
-privacy filters, journal integrity checks and sender failure isolation. Its
-transport is now an explicit command. Controlled sender and HookBus tests do
+The runtime uses a journal reducer, hook selection, privacy filters, journal
+integrity checks and sender failure isolation. It sends messages through an
+explicit command. Controlled sender and HookBus tests do
 not establish receipt by Codex or any other recipient, or execution of every
 conditional engine path. Compatibility is limited to the tested Loop version.
 

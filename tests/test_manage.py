@@ -35,10 +35,13 @@ class ManagerTest(unittest.TestCase):
         m.git('config', 'user.email', 'test@example.invalid')
         shutil.copytree(ROOT / 'plugins', self.collection / 'plugins')
         shutil.copytree(ROOT / 'compatibility', self.collection / 'compatibility')
-        notify_manifest = self.collection / 'plugins/codex-notify/plugin.toml'
-        import re
-        notify_manifest.write_text(re.sub(r'version = "\d+\.\d+\.\d+"',
-                                          'version = "1.0.0"', notify_manifest.read_text()))
+        legacy = self.collection / 'plugins/legacy-notify'
+        shutil.copytree(self.collection / 'plugins/status-notify', legacy)
+        manifest = legacy / 'plugin.toml'
+        manifest.write_text(manifest.read_text().replace('name = "status-notify"',
+                                                        'name = "legacy-notify"'))
+        shutil.copyfile(self.collection / 'compatibility/status-notify.toml',
+                        self.collection / 'compatibility/legacy-notify.toml')
         self.tag('0.1.0')
         self.loop = self.project / '.bmad-loop/cache/bin/bmad-loop'
         self.loop.parent.mkdir(parents=True)
@@ -84,49 +87,51 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(self.tx.exists())
 
-    def test_real_plugins_install_and_update_independently(self):
-        m.git('tag', 'codex-notify-v1.0.0')
+    def test_plugins_install_and_update_independently(self):
+        m.git('tag', 'legacy-notify-v1.0.0')
         self.change()
         with contextlib.redirect_stdout(io.StringIO()):
-            m.change('install', 'codex-notify', '1.0.0', self.project)
-        notify = self.dest.parent / 'codex-notify'
+            m.change('install', 'legacy-notify', '1.0.0', self.project)
+        notify = self.dest.parent / 'legacy-notify'
         before_tree = m.tree(notify)
-        before_record = json.loads(self.lock.read_text())['plugins']['codex-notify']
-        binding = self.project / '.bmad-loop/runs/fixture/codex-notify/state.json'
+        before_record = json.loads(self.lock.read_text())['plugins']['legacy-notify']
+        binding = self.project / '.bmad-loop/runs/fixture/legacy-notify/state.json'
         binding.parent.mkdir(parents=True)
         binding.write_text('{"binding":"fixture-only"}')
         self.tag('0.1.1')
         self.change('0.1.1', 'update')
         self.assertEqual(m.tree(notify), before_tree)
-        self.assertEqual(json.loads(self.lock.read_text())['plugins']['codex-notify'], before_record)
+        self.assertEqual(json.loads(self.lock.read_text())['plugins']['legacy-notify'], before_record)
         self.assertEqual(binding.read_text(), '{"binding":"fixture-only"}')
         with contextlib.redirect_stdout(io.StringIO()) as output:
             m.status(self.project)
-        self.assertIn('codex-notify 1.0.0: clean', output.getvalue())
+        self.assertIn('legacy-notify 1.0.0: clean', output.getvalue())
         self.assertIn('delivery 0.1.1: clean', output.getvalue())
         delivery_tree = m.tree(self.dest)
         delivery_record = json.loads(self.lock.read_text())['plugins']['delivery']
-        manifest = self.collection / 'plugins/codex-notify/plugin.toml'
+        manifest = self.collection / 'plugins/legacy-notify/plugin.toml'
         manifest.write_text(manifest.read_text().replace('version = "1.0.0"', 'version = "1.0.1"'))
         m.git('add', '.')
         m.git('commit', '-m', 'notify fixture release')
-        m.git('tag', 'codex-notify-v1.0.1')
+        m.git('tag', 'legacy-notify-v1.0.1')
         with contextlib.redirect_stdout(io.StringIO()):
-            m.change('update', 'codex-notify', '1.0.1', self.project)
+            m.change('update', 'legacy-notify', '1.0.1', self.project)
         self.assertEqual(m.tree(self.dest), delivery_tree)
         self.assertEqual(json.loads(self.lock.read_text())['plugins']['delivery'], delivery_record)
         self.assertEqual(binding.read_text(), '{"binding":"fixture-only"}')
-        self.assertEqual(json.loads(self.lock.read_text())['plugins']['codex-notify']['version'], '1.0.1')
+        self.assertEqual(json.loads(self.lock.read_text())['plugins']['legacy-notify']['version'], '1.0.1')
 
-    def test_status_notify_tag_install_preserves_old_plugin_and_state(self):
-        m.git('tag', 'codex-notify-v1.0.0')
+    def test_removed_plugin_release_and_state_survive_status_notify_install(self):
+        m.git('tag', 'legacy-notify-v1.0.0')
         m.git('tag', 'status-notify-v1.0.0')
+        shutil.rmtree(self.collection / 'plugins/legacy-notify')
+        (self.collection / 'compatibility/legacy-notify.toml').unlink()
         with contextlib.redirect_stdout(io.StringIO()):
-            m.change('install', 'codex-notify', '1.0.0', self.project)
-        old = self.dest.parent / 'codex-notify'
+            m.change('install', 'legacy-notify', '1.0.0', self.project)
+        old = self.dest.parent / 'legacy-notify'
         old_tree = m.tree(old)
-        old_record = json.loads(self.lock.read_text())['plugins']['codex-notify']
-        binding = self.project / '.bmad-loop/runs/fixture/codex-notify/state.json'
+        old_record = json.loads(self.lock.read_text())['plugins']['legacy-notify']
+        binding = self.project / '.bmad-loop/runs/fixture/legacy-notify/state.json'
         binding.parent.mkdir(parents=True)
         binding.write_text('{"binding":"fixture-only"}')
         source = self.collection / 'plugins/status-notify/notify.py'
@@ -137,7 +142,7 @@ class ManagerTest(unittest.TestCase):
         self.assertNotEqual((installed / 'notify.py').read_bytes(), source.read_bytes())
         self.assertEqual(m.tree(old), old_tree)
         records = json.loads(self.lock.read_text())['plugins']
-        self.assertEqual(records['codex-notify'], old_record)
+        self.assertEqual(records['legacy-notify'], old_record)
         self.assertEqual(records['status-notify']['digest'], m.digest(m.tree(installed)))
         self.assertEqual(binding.read_text(), '{"binding":"fixture-only"}')
         self.assertIn('plugins enable status-notify', output.getvalue())
@@ -146,6 +151,15 @@ class ManagerTest(unittest.TestCase):
             m.change('install', 'status-notify', '1.0.0', self.project)
         self.assertEqual((m.tree(installed), self.lock.read_bytes()), before)
         self.assertFalse((binding.parents[1] / 'status-notify').exists())
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            m.status(self.project)
+        self.assertIn('legacy-notify 1.0.0: clean', output.getvalue())
+        self.assertIn('status-notify 1.0.0: clean', output.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.change('install', 'legacy-notify', '1.0.0', self.project)
+        self.assertEqual((m.tree(installed), self.lock.read_bytes()), before)
+        self.assertEqual(m.tree(old), old_tree)
+        self.assertEqual(binding.read_text(), '{"binding":"fixture-only"}')
 
     def test_update_and_rollback_show_diff_preserve_config_other_plugins(self):
         self.change()
