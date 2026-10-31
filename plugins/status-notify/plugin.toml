@@ -1,0 +1,33 @@
+[plugin]
+name = "status-notify"
+version = "1.0.0"
+api_version = 1
+description = "Advisory run and story status notifications through an explicit sender command"
+
+[hooks.pre_run]
+cmd = 'python3 "{scripts}/notify.py" launch'
+timeout_sec = 5
+blocking = false
+fail_closed = false
+
+[python]
+module = "notify.py"
+class = "Plugin"
+
+[[settings]]
+key = "hooks"
+type = "str"
+default = "*"
+help = "Hook notifications for new runs: * for all, comma-separated exact names, or empty for none; journal notifications stay active"
+
+[[settings]]
+key = "destination"
+type = "str"
+default = ""
+help = "Notification recipient; BMAD_STATUS_NOTIFY_DESTINATION overrides this for a new run"
+
+[[settings]]
+key = "sender_command"
+type = "str"
+default = ""
+help = "POSIX-quoted command with {destination} and {message}; parsed before substitution, without a shell"

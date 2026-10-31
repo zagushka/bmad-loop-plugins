@@ -1,5 +1,12 @@
 # Codex Notify changelog
 
+## Deprecation — 2026-10-31
+
+Deprecated for new runs in favor of [status-notify](../status-notify/README.md),
+which supports an explicit sender command. This is a documentation notice;
+published runtime versions and immutable tags are unchanged. Existing runs keep
+their bindings. See the replacement guide for an explicit between-runs transition.
+
 ## 1.1.0 — 2026-10-31
 
 - Add an API-1 bridge for all 49 lifecycle hooks emitted by bmad-loop 0.13.2,

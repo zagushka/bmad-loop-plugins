@@ -1,5 +1,10 @@
 # Codex lifecycle notifications
 
+**Deprecated:** use [status-notify](../status-notify/README.md) for new runs after
+its release. Existing runtime versions, tags, grants, snapshots and saved bindings
+remain unchanged. Follow the [transition guide](../status-notify/README.md#transition-from-deprecated-codex-notify)
+between runs; do not enable both plugins for the same run.
+
 This plugin queues short hook and journal messages to one existing Codex chat
 per run. The journal observer reads the run's append-only `journal.jsonl`. It
 does not change the application or bmad-loop core.
