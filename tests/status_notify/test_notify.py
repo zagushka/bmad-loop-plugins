@@ -91,7 +91,8 @@ class SenderTests(unittest.TestCase):
             run = Path(temp)
             env = dict(BMAD_STATUS_NOTIFY_DESTINATION="original",
                        BMAD_LOOP_SETTING_SENDER_COMMAND=sender_command("original-sender"),
-                       BMAD_LOOP_SETTING_HOOKS="pre_commit")
+                       BMAD_LOOP_SETTING_HOOKS="pre_commit",
+                       BMAD_LOOP_SETTING_JOURNAL_EVENTS="run-crash")
             with patch.dict(os.environ, env), \
                     patch.object(notify.subprocess, "Popen", side_effect=OSError):
                 with self.assertRaises(OSError):
@@ -100,7 +101,8 @@ class SenderTests(unittest.TestCase):
             saved = state.read_bytes()
             with patch.dict(os.environ, dict(BMAD_STATUS_NOTIFY_DESTINATION="changed",
                                             BMAD_LOOP_SETTING_SENDER_COMMAND="invalid {SECRET}",
-                                            BMAD_LOOP_SETTING_HOOKS="unknown")), \
+                                            BMAD_LOOP_SETTING_HOOKS="unknown",
+                                            BMAD_LOOP_SETTING_JOURNAL_EVENTS="unknown")), \
                     patch.object(notify.subprocess, "Popen") as spawn:
                 notify.launch(run)
                 spawn.assert_called_once()
@@ -109,6 +111,7 @@ class SenderTests(unittest.TestCase):
             self.assertEqual(binding["destination"], "original")
             self.assertEqual(binding["sender_argv"][0], "original-sender")
             self.assertEqual(binding["hooks"], ["pre_commit"])
+            self.assertEqual(binding["journal_events"], ["run-crash"])
 
     def test_old_codex_settings_alone_do_not_configure_new_plugin(self):
         with patch.dict(os.environ, dict(BMAD_STATUS_NOTIFY_DESTINATION="",
@@ -262,6 +265,67 @@ class ReducerTests(unittest.TestCase):
             self.assertNotIn("development resumed", message)
 
 
+class JournalSelectionTests(unittest.TestCase):
+    def test_selection_contract(self):
+        select = lambda value: notify.selected_names(value, notify.JOURNAL_EVENTS, "journal_events")
+        self.assertEqual(set(select(" * ")), notify.JOURNAL_EVENTS)
+        self.assertEqual(select("  "), [])
+        self.assertEqual(select("run-crash, story-done,run-crash"), ["run-crash", "story-done"])
+        for value in (None, [], True, "session-end", "run-crash,", ",run-crash",
+                      "*,run-crash", "RUN-START", "unknown"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                select(value)
+
+    def test_binding_defaults_and_selection(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(set(notify.binding_from_env(Path("/run"))["journal_events"]),
+                             notify.JOURNAL_EVENTS)
+            for value, expected in (("", []), ("run-crash,story-done", ["run-crash", "story-done"])):
+                with patch.dict(os.environ, {"BMAD_LOOP_SETTING_JOURNAL_EVENTS": value}):
+                    self.assertEqual(notify.binding_from_env(Path("/run"))["journal_events"], expected)
+
+    def test_filter_preserves_state_for_selected_activity_and_restart(self):
+        state = notify.initial(sender_binding(run_id="r", journal_events=["session-unparked", "session-start"]))
+        events = [dict(kind="story-start", story_key="1.2"),
+                  dict(kind="run-paused"), dict(kind="session-start", task_id="t", story_key="1.2"),
+                  dict(kind="session-parked", task_id="t"), dict(kind="parked-answered", task_id="t"),
+                  dict(kind="session-unparked", task_id="t", how="activity"),
+                  dict(kind="session-unparked", task_id="t", how="activity"),
+                  dict(kind="session-end", task_id="t"),
+                  dict(kind="session-parked", task_id="t"), dict(kind="run-complete")]
+        messages = [notify.reduce_event(state, event) for event in events]
+        self.assertEqual([i for i, message in enumerate(messages) if message], [2, 5])
+        self.assertIn("restarting", messages[2])
+        self.assertIn("activity detected", messages[5])
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["sessions"], {})
+
+    def test_filtered_quota_start_still_tracks_selected_end(self):
+        state = notify.initial(sender_binding(run_id="r", journal_events=["quota-wait-ended"]))
+        for event in (dict(kind="session-start", story_key="1.2", task_id="t"),
+                      dict(kind="quota-wait-started", task_id="t")):
+            self.assertIsNone(notify.reduce_event(state, event))
+        event = dict(kind="quota-wait-ended", task_id="t", how="transcript-active")
+        self.assertIn("activity detected", notify.reduce_event(state, event))
+        self.assertIsNone(notify.reduce_event(state, event))
+
+    def test_invalid_selection_creates_no_binding_or_observer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            env = dict(BMAD_STATUS_NOTIFY_DESTINATION="fixture",
+                       BMAD_LOOP_SETTING_SENDER_COMMAND=sender_command("unused"),
+                       BMAD_LOOP_SETTING_JOURNAL_EVENTS="private-unknown")
+            with patch.dict(os.environ, env):
+                self.assertEqual(subprocess.run([sys.executable, "-B", str(ROOT / "notify.py"),
+                                               "launch", "--run-dir", str(run)],
+                                              env=dict(os.environ), capture_output=True, timeout=3).returncode, 0)
+            folder = run / notify.STATE_DIR
+            self.assertFalse((folder / "state.json").exists())
+            log = (folder / "diagnostics.log").read_text()
+            self.assertIn("ValueError", log)
+            self.assertNotIn("private-unknown", log)
+
+
 class HookTests(unittest.TestCase):
     def test_selection_contract(self):
         self.assertEqual(len(notify.HOOKS), 49)
@@ -356,6 +420,19 @@ class JournalTests(unittest.TestCase):
         self.consume()
         self.assertEqual(len(self.messages), 1)
         self.assertEqual(self.state["offset"], self.journal.stat().st_size)
+
+    def test_selection_persists_cursor_and_does_not_replay_filtered_records(self):
+        self.state["binding"]["journal_events"] = ["story-done"]
+        self.journal.write_text('{"kind":"run-start"}\n{"kind":"story-done","story_key":"1.2"}\n'
+                                '{"kind":"run-complete"}\n')
+        self.consume()
+        self.assertEqual(len(self.messages), 1)
+        self.assertIn("Story 1.2: done", self.messages[0][1])
+        self.assertTrue(self.state["complete"])
+        self.assertEqual(self.state["offset"], self.journal.stat().st_size)
+        self.state = json.loads((self.folder / "state.json").read_text())
+        self.consume()
+        self.assertEqual(len(self.messages), 1)
 
     def test_integer_limit_and_deep_json_skip_then_deliver_valid_event(self):
         digits = max(sys.get_int_max_str_digits(), 4300) + 100
@@ -509,12 +586,48 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(sum("Run started" in m[-1] for m in messages), 2)
         self.assertTrue(all(m[2] == ("chat-a" if "[bmad-loop a]" in m[-1] else "chat-b") for m in messages))
 
+    def test_both_channels_disabled_and_observer_exits_on_filtered_completion(self):
+        run = self.create_run("silent")
+        self.append(run, "run-start")
+        self.append(run, "story-start", story_key="1.2")
+        self.append(run, "run-complete")
+        with patch.dict(os.environ, dict(BMAD_LOOP_SETTING_HOOKS="", BMAD_LOOP_SETTING_JOURNAL_EVENTS="")):
+            self.launch(run)
+        self.wait_for(lambda: self.consumed(run))
+        self.wait_for(lambda: not (run / notify.STATE_DIR / "observer.pid").exists())
+        state = json.loads((run / notify.STATE_DIR / "state.json").read_text())
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["binding"]["journal_events"], [])
+        for stage in notify.HOOKS:
+            notify.deliver(run, stage, "disabled")
+        self.assertEqual(self.messages(), [])
+
     def _lock_available(self, run):
         folder, lock = notify.lock_run(run)
         if lock:
             lock.close()
             return True
         return False
+
+    def test_observer_restart_keeps_saved_journal_selection(self):
+        run = self.create_run("selection-restart")
+        self.append(run, "run-start")
+        self.append(run, "run-crash")
+        with patch.dict(os.environ, {"BMAD_LOOP_SETTING_JOURNAL_EVENTS": "run-crash"}):
+            self.launch(run)
+        self.wait_for(lambda: len(self.messages()) == 1)
+        (run / notify.STATE_DIR / "stop").touch()
+        self.wait_for(lambda: not (run / notify.STATE_DIR / "observer.pid").exists())
+        with patch.dict(os.environ, {"BMAD_LOOP_SETTING_JOURNAL_EVENTS": "story-done"}):
+            self.launch(run)
+        for kind in ("run-crash", "story-done", "run-complete"):
+            self.append(run, kind)
+        self.wait_for(lambda: self.consumed(run))
+        self.wait_for(lambda: not (run / notify.STATE_DIR / "observer.pid").exists())
+        self.assertEqual(len(self.messages()), 2)
+        self.assertTrue(all("Run crashed" in message[-1] for message in self.messages()))
+        binding = json.loads((run / notify.STATE_DIR / "state.json").read_text())["binding"]
+        self.assertEqual(binding["journal_events"], ["run-crash"])
 
     def test_setup_missing_sender_nonzero_and_hanging_sender_never_block(self):
         for mode in ("missing", "failure", "hang"):
@@ -618,30 +731,38 @@ class ProcessTests(unittest.TestCase):
             from bmad_loop.plugins.registry import PluginRegistry
         except ImportError:
             self.skipTest("Requires installed bmad-loop Python")
-        run = self.create_run("generic")
-        (run / "journal.jsonl").write_text("")
-        manifest = load_manifest((ROOT / "plugin.toml").read_text(), "test", str(ROOT))
-        settings = dict(destination="configured-room", hooks="pre_commit",
-                        sender_command=shlex.join([str(self.sender), "{message}", "--recipient={destination}"]))
-        plugin = LoadedPlugin(manifest=manifest, instance=notify.Plugin(manifest, settings), settings=settings)
-        bus = HookBus(PluginRegistry([plugin]))
-        workers = []
-        handle = notify.handle_hook
-        def record(stage, ctx):
-            worker = handle(stage, ctx)
-            if worker:
-                workers.append(worker)
-        with patch.dict(os.environ, {"BMAD_STATUS_NOTIFY_DESTINATION": "override-room"}), \
-                patch.object(notify, "handle_hook", side_effect=record):
-            for stage in ("pre_run", "pre_commit"):
-                ctx = HookContext(stage, run_id=run.name, run_dir=str(run), repo_root=str(self.base))
-                self.assertFalse(bus.emit(stage, ctx).vetoed)
-        for worker in workers:
-            self.assertEqual(worker.wait(timeout=5), 0)
-        self.wait_for(lambda: len(self.messages()) == 1)
-        message, recipient = self.messages()[0]
-        self.assertIn("Hook pre_commit invoked", message)
-        self.assertEqual(recipient, "--recipient=override-room")
+        for selection in ("run-crash", ""):
+            run = self.create_run("generic-" + ("selected" if selection else "silent"))
+            before = len(self.messages())
+            (run / "journal.jsonl").write_text("")
+            for kind in ("run-start", "run-crash", "run-complete"):
+                self.append(run, kind)
+            manifest = load_manifest((ROOT / "plugin.toml").read_text(), "test", str(ROOT))
+            settings = dict(destination="configured-room", hooks="pre_commit", journal_events=selection,
+                            sender_command=shlex.join([str(self.sender), "{message}", "--recipient={destination}"]))
+            plugin = LoadedPlugin(manifest=manifest, instance=notify.Plugin(manifest, settings), settings=settings)
+            bus = HookBus(PluginRegistry([plugin]))
+            workers = []
+            handle = notify.handle_hook
+            def record(stage, ctx):
+                worker = handle(stage, ctx)
+                if worker:
+                    workers.append(worker)
+            with patch.dict(os.environ, {"BMAD_STATUS_NOTIFY_DESTINATION": "override-room"}), \
+                    patch.object(notify, "handle_hook", side_effect=record):
+                for stage in ("pre_run", "pre_commit"):
+                    ctx = HookContext(stage, run_id=run.name, run_dir=str(run), repo_root=str(self.base))
+                    self.assertFalse(bus.emit(stage, ctx).vetoed)
+            for worker in workers:
+                self.assertEqual(worker.wait(timeout=5), 0)
+            self.wait_for(lambda: len(self.messages()) == before + 1 + bool(selection))
+            self.wait_for(lambda: not (run / notify.STATE_DIR / "observer.pid").exists())
+            messages = self.messages()[before:]
+            self.assertTrue(any("Hook pre_commit invoked" in message for message, _ in messages))
+            self.assertEqual(any("Run crashed" in message for message, _ in messages), bool(selection))
+            self.assertTrue(all(recipient == "--recipient=override-room" for _, recipient in messages))
+            binding = json.loads((run / notify.STATE_DIR / "state.json").read_text())["binding"]
+            self.assertEqual(binding["journal_events"], [selection] if selection else [])
 
     def test_selected_hooks_and_missing_hooks_through_real_bus(self):
         try:
