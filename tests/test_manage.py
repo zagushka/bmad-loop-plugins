@@ -118,6 +118,35 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual(binding.read_text(), '{"binding":"fixture-only"}')
         self.assertEqual(json.loads(self.lock.read_text())['plugins']['codex-notify']['version'], '1.0.1')
 
+    def test_status_notify_tag_install_preserves_old_plugin_and_state(self):
+        m.git('tag', 'codex-notify-v1.0.0')
+        m.git('tag', 'status-notify-v1.0.0')
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.change('install', 'codex-notify', '1.0.0', self.project)
+        old = self.dest.parent / 'codex-notify'
+        old_tree = m.tree(old)
+        old_record = json.loads(self.lock.read_text())['plugins']['codex-notify']
+        binding = self.project / '.bmad-loop/runs/fixture/codex-notify/state.json'
+        binding.parent.mkdir(parents=True)
+        binding.write_text('{"binding":"fixture-only"}')
+        source = self.collection / 'plugins/status-notify/notify.py'
+        source.write_text('uncommitted must never install')
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            m.change('install', 'status-notify', '1.0.0', self.project)
+        installed = self.dest.parent / 'status-notify'
+        self.assertNotEqual((installed / 'notify.py').read_bytes(), source.read_bytes())
+        self.assertEqual(m.tree(old), old_tree)
+        records = json.loads(self.lock.read_text())['plugins']
+        self.assertEqual(records['codex-notify'], old_record)
+        self.assertEqual(records['status-notify']['digest'], m.digest(m.tree(installed)))
+        self.assertEqual(binding.read_text(), '{"binding":"fixture-only"}')
+        self.assertIn('plugins enable status-notify', output.getvalue())
+        before = m.tree(installed), self.lock.read_bytes()
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.change('install', 'status-notify', '1.0.0', self.project)
+        self.assertEqual((m.tree(installed), self.lock.read_bytes()), before)
+        self.assertFalse((binding.parents[1] / 'status-notify').exists())
+
     def test_update_and_rollback_show_diff_preserve_config_other_plugins(self):
         self.change()
         private = self.project / 'private.json'
