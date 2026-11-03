@@ -1,5 +1,21 @@
 # Status Notify changelog
 
+## 2.0.0 — Unreleased
+
+- Add `debounce_seconds`: a nonnegative integer quiet window, with zero for
+  immediate delivery. Each selected message resets a positive window. Journal
+  and hook messages share one batch per run, including after observer completion.
+- Pass a JSON array of strings through `{message}` for every new run binding,
+  including immediate delivery. This changes the sender contract. Existing saved
+  bindings retain plain strings and immediate delivery without migration.
+- Freeze the window per run. Keep batch state separate from observer state and
+  claim batches before each single sender attempt. No retry or receipt guarantee.
+- Keep one waiting batch worker per run and split large buffers into successive
+  JSON arrays to limit the size of command arguments.
+
+Compatibility: unchanged Python 3.11+, POSIX, bmad-loop 0.13.2 / API 1.
+Not released or installed; the reviewed 1.1.0 tag remains unchanged.
+
 ## 1.1.0 — 2026-10-31
 
 - Add independent `journal_events` selection: `*` (default), comma-separated

@@ -32,6 +32,43 @@ def sender_binding(run_id, thread_id="", codex_path="codex", **fields):
 
 
 class SenderTests(unittest.TestCase):
+    def test_debounce_setting_defaults_and_rejects_invalid_windows(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(notify.binding_from_env(Path("/run"))["debounce_seconds"], 0)
+            for value in ("0", "1", "30"):
+                with patch.dict(os.environ, BMAD_LOOP_SETTING_DEBOUNCE_SECONDS=value):
+                    self.assertEqual(notify.binding_from_env(Path("/run"))["debounce_seconds"], int(value))
+            for value in ("-1", "0.5", "nan", "inf", "true", "", "SECRET"):
+                with self.subTest(value=value), tempfile.TemporaryDirectory() as temp:
+                    run = Path(temp)
+                    with patch.dict(os.environ, BMAD_LOOP_SETTING_DEBOUNCE_SECONDS=value), \
+                            patch.object(notify.subprocess, "Popen") as spawn:
+                        with self.assertRaises(ValueError):
+                            notify.launch(run)
+                        spawn.assert_not_called()
+                    self.assertFalse((run / notify.STATE_DIR / "state.json").exists())
+
+    def test_zero_window_sends_json_array_and_legacy_keeps_string(self):
+        message = 'line one\n"quoted" {destination} Русский'
+        binding = dict(destination="room", sender_argv=notify.sender_arguments("sender {destination} {message}"))
+        with patch.object(notify.subprocess, "Popen") as spawn:
+            notify.send(Path("/unused"), binding, message, [])
+            self.assertEqual(spawn.call_args.args[0][-1], message)
+            notify.send(Path("/unused"), dict(binding, debounce_seconds=0), message, [])
+            self.assertEqual(json.loads(spawn.call_args.args[0][-1]), [message])
+
+    def test_each_message_resets_the_shared_deadline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            binding = dict(debounce_seconds=10)
+            with patch.object(notify.subprocess, "Popen"), \
+                    patch.object(notify.time, "monotonic", side_effect=[100, 107]):
+                notify.send(folder, binding, "first", [])
+                self.assertEqual(json.loads((folder / "batch.json").read_text())["deadline"], 110)
+                notify.send(folder, binding, "second", [])
+            batch = json.loads((folder / "batch.json").read_text())
+            self.assertEqual(batch, dict(messages=["first", "second"], deadline=117))
+
     def test_template_preserves_arguments_and_does_not_expand_inserted_values(self):
         command = "'/path with spaces/sender' --thread={destination} --message '{message}' '{{literal}}'"
         destination = "chat {message} ' \" ; $(touch SHOULD_NOT_EXIST)"
@@ -92,7 +129,8 @@ class SenderTests(unittest.TestCase):
             env = dict(BMAD_STATUS_NOTIFY_DESTINATION="original",
                        BMAD_LOOP_SETTING_SENDER_COMMAND=sender_command("original-sender"),
                        BMAD_LOOP_SETTING_HOOKS="pre_commit",
-                       BMAD_LOOP_SETTING_JOURNAL_EVENTS="run-crash")
+                       BMAD_LOOP_SETTING_JOURNAL_EVENTS="run-crash",
+                       BMAD_LOOP_SETTING_DEBOUNCE_SECONDS="10")
             with patch.dict(os.environ, env), \
                     patch.object(notify.subprocess, "Popen", side_effect=OSError):
                 with self.assertRaises(OSError):
@@ -102,7 +140,8 @@ class SenderTests(unittest.TestCase):
             with patch.dict(os.environ, dict(BMAD_STATUS_NOTIFY_DESTINATION="changed",
                                             BMAD_LOOP_SETTING_SENDER_COMMAND="invalid {SECRET}",
                                             BMAD_LOOP_SETTING_HOOKS="unknown",
-                                            BMAD_LOOP_SETTING_JOURNAL_EVENTS="unknown")), \
+                                            BMAD_LOOP_SETTING_JOURNAL_EVENTS="unknown",
+                                            BMAD_LOOP_SETTING_DEBOUNCE_SECONDS="SECRET")), \
                     patch.object(notify.subprocess, "Popen") as spawn:
                 notify.launch(run)
                 spawn.assert_called_once()
@@ -112,6 +151,7 @@ class SenderTests(unittest.TestCase):
             self.assertEqual(binding["sender_argv"][0], "original-sender")
             self.assertEqual(binding["hooks"], ["pre_commit"])
             self.assertEqual(binding["journal_events"], ["run-crash"])
+            self.assertEqual(binding["debounce_seconds"], 10)
 
     def test_old_codex_settings_alone_do_not_configure_new_plugin(self):
         with patch.dict(os.environ, dict(BMAD_STATUS_NOTIFY_DESTINATION="",
@@ -551,8 +591,108 @@ class ProcessTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2)
 
     def messages(self):
+        messages = []
+        for args in self.raw_messages():
+            index = args.index("--message") + 1 if "--message" in args else 0
+            payload = args[index]
+            for message in json.loads(payload) if payload.startswith('["') else [payload]:
+                messages.append(args[:index] + [message] + args[index + 1:])
+        return messages
+
+    def raw_messages(self):
         path = self.base / "messages.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_new_binding_sends_array_at_zero_window(self):
+        run = self.create_run("array")
+        self.append(run, "run-complete")
+        self.launch(run)
+        self.wait_for(lambda: len(self.raw_messages()) == 1)
+        payload = json.loads(self.raw_messages()[0][-1])
+        self.assertEqual(len(payload), 1)
+        self.assertIn("Run completed", payload[0])
+
+    def test_trailing_debounce_combines_journal_and_concurrent_hooks_after_completion(self):
+        run = self.create_run("batch")
+        self.append(run, "run-start")
+        with patch.dict(os.environ, BMAD_LOOP_SETTING_DEBOUNCE_SECONDS="30"):
+            self.launch(run)
+        self.wait_for(lambda: (run / notify.STATE_DIR / "batch.json").exists())
+        workers = [notify.handle_hook("pre_commit", SimpleNamespace(run_dir=str(run), run_id=run.name))
+                   for _ in range(6)]
+        for worker in workers:
+            self.assertEqual(worker.wait(timeout=5), 0)
+        self.append(run, "run-complete")
+        self.wait_for(lambda: self.consumed(run))
+        self.wait_for(lambda: not (run / notify.STATE_DIR / "observer.pid").exists())
+        self.assertEqual(self.raw_messages(), [])
+        folder = run / notify.STATE_DIR
+        # A second collector must exit while the elected worker waits for silence.
+        result = subprocess.run([sys.executable, str(ROOT / "notify.py"), "flush", "--run-dir", str(run)],
+                                capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.raw_messages(), [])
+        with (folder / "batch.lock").open("a+") as lock:
+            notify.fcntl.flock(lock, notify.fcntl.LOCK_EX)
+            batch = json.loads((folder / "batch.json").read_text())
+            self.assertEqual(len(batch["messages"]), 8)
+            batch["deadline"] = time.monotonic() - 1
+            notify.save(folder, batch, "batch")
+        self.wait_for(lambda: len(self.raw_messages()) == 1)
+        payload = json.loads(self.raw_messages()[0][-1])
+        self.assertEqual(len(payload), 8)
+        self.assertIn("Run started", payload[0])
+        self.assertEqual(sum("Hook pre_commit invoked" in item for item in payload), 6)
+        self.assertEqual(sum("Run completed" in item for item in payload), 1)
+        self.assertEqual(json.loads((run / notify.STATE_DIR / "batch.json").read_text())["messages"], [])
+        time.sleep(0.3)
+        self.assertEqual(len(self.raw_messages()), 1)
+
+    def test_large_batch_is_split_without_losing_messages(self):
+        run = self.create_run("large-batch")
+        folder = run / notify.STATE_DIR
+        binding = sender_binding(run_id=run.name, thread_id="fixture", codex_path=self.sender,
+                                 debounce_seconds=1)
+        notify.save(folder, notify.initial(binding))
+        messages = [f'{index}: "Русский" ' + "x" * 1000 for index in range(300)]
+        notify.save(folder, dict(messages=messages, deadline=time.monotonic() - 1), "batch")
+        notify.flush_batch(run)
+        calls = self.raw_messages()
+        self.assertGreater(len(calls), 1)
+        self.assertTrue(all(len(args[-1].encode("ascii")) <= notify.MAX_BATCH_BYTES for args in calls))
+        self.assertEqual([message for args in calls for message in json.loads(args[-1])], messages)
+
+    def test_debounce_is_per_run_and_uses_saved_window(self):
+        a, b = self.create_run("batch-a"), self.create_run("batch-b")
+        for run in (a, b):
+            self.append(run, "run-complete")
+            with patch.dict(os.environ, BMAD_LOOP_SETTING_DEBOUNCE_SECONDS="1"):
+                self.launch(run, thread=run.name)
+        self.wait_for(lambda: len(self.raw_messages()) == 2)
+        for args in self.raw_messages():
+            payload = json.loads(args[-1])
+            self.assertEqual(len(payload), 1)
+            self.assertIn(f"[bmad-loop {args[2]}]", payload[0])
+        # A later hook uses the frozen window after the observer has exited.
+        with patch.dict(os.environ, BMAD_LOOP_SETTING_DEBOUNCE_SECONDS="0"):
+            notify.deliver(a, "pre_commit", "late hook")
+        self.assertEqual(len(self.raw_messages()), 2)
+        self.wait_for(lambda: len(self.raw_messages()) == 3)
+        self.assertEqual(json.loads(self.raw_messages()[-1][-1]), ["late hook"])
+
+    def test_failed_batch_is_not_retried(self):
+        run = self.create_run("batch-failure")
+        self.append(run, "run-complete")
+        with patch.dict(os.environ, BMAD_LOOP_SETTING_DEBOUNCE_SECONDS="1"):
+            self.launch(run, sender=self.base / "missing-sender")
+        path = run / notify.STATE_DIR / "batch.json"
+        self.wait_for(lambda: path.exists() and not json.loads(path.read_text())["messages"])
+        self.wait_for(lambda: "sender launch failed" in
+                      (run / notify.STATE_DIR / "diagnostics.log").read_text()
+                      if (run / notify.STATE_DIR / "diagnostics.log").exists() else False)
+        with patch.object(notify.subprocess, "Popen") as spawn:
+            notify.flush_batch(run)
+            spawn.assert_not_called()
 
     def consumed(self, run):
         state = run / notify.STATE_DIR / "state.json"
@@ -739,6 +879,7 @@ class ProcessTests(unittest.TestCase):
                 self.append(run, kind)
             manifest = load_manifest((ROOT / "plugin.toml").read_text(), "test", str(ROOT))
             settings = dict(destination="configured-room", hooks="pre_commit", journal_events=selection,
+                            debounce_seconds=1,
                             sender_command=shlex.join([str(self.sender), "{message}", "--recipient={destination}"]))
             plugin = LoadedPlugin(manifest=manifest, instance=notify.Plugin(manifest, settings), settings=settings)
             bus = HookBus(PluginRegistry([plugin]))
@@ -763,6 +904,7 @@ class ProcessTests(unittest.TestCase):
             self.assertTrue(all(recipient == "--recipient=override-room" for _, recipient in messages))
             binding = json.loads((run / notify.STATE_DIR / "state.json").read_text())["binding"]
             self.assertEqual(binding["journal_events"], [selection] if selection else [])
+            self.assertEqual(binding["debounce_seconds"], 1)
 
     def test_selected_hooks_and_missing_hooks_through_real_bus(self):
         try:

@@ -18,6 +18,7 @@ import time
 STATE_DIR = "status-notify"
 POLL_SECONDS = 0.2
 SENDER_TIMEOUT = 15
+MAX_BATCH_BYTES = 32 * 1024
 # Emitted API-1 hooks in bmad-loop 0.13.2; pre_commit_gate is workflow-only.
 HOOKS = frozenset("""
 pre_run post_run pre_pick_next post_pick_next pre_story post_story
@@ -166,13 +167,13 @@ def reduce_event(state, event):
             + json.dumps(context, ensure_ascii=True))
 
 
-def save(folder, state):
-    temp = folder / "state.tmp"
+def save(folder, state, name="state"):
+    temp = folder / f"{name}.tmp"
     with temp.open("w", encoding="utf-8") as stream:
         json.dump(state, stream, separators=(",", ":"))
         stream.flush()
         os.fsync(stream.fileno())
-    temp.replace(folder / "state.json")
+    temp.replace(folder / f"{name}.json")
     fd = os.open(folder, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -220,10 +221,14 @@ def sender_arguments(command):
 
 
 def binding_from_env(run_dir):
+    debounce_seconds = int(os.environ.get("BMAD_LOOP_SETTING_DEBOUNCE_SECONDS", "0"))
+    if debounce_seconds < 0:
+        raise ValueError("debounce_seconds must be nonnegative")
     return dict(project=str(Path(os.environ.get("BMAD_LOOP_REPO_ROOT") or run_dir.parent).resolve()),
                 journal=str(run_dir / "journal.jsonl"), run_id=os.environ.get("BMAD_LOOP_RUN_ID", "?"),
                 destination=os.environ.get("BMAD_STATUS_NOTIFY_DESTINATION") or os.environ.get("BMAD_LOOP_SETTING_DESTINATION", ""),
                 sender_argv=sender_arguments(os.environ.get("BMAD_LOOP_SETTING_SENDER_COMMAND", "")),
+                debounce_seconds=debounce_seconds,
                 hooks=selected_hooks(os.environ.get("BMAD_LOOP_SETTING_HOOKS", "*")),
                 journal_events=selected_names(os.environ.get("BMAD_LOOP_SETTING_JOURNAL_EVENTS", "*"),
                                               JOURNAL_EVENTS, "journal_events"))
@@ -253,6 +258,20 @@ def launch(run_dir):
 
 def send(folder, binding, message, pending):
     try:
+        if binding.get("debounce_seconds", 0) > 0:
+            with (folder / "batch.lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                path = folder / "batch.json"
+                batch = json.loads(path.read_text()) if path.exists() else dict(messages=[])
+                batch["messages"].append(message)
+                batch["deadline"] = time.monotonic() + binding["debounce_seconds"]
+                save(folder, batch, "batch")
+            subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "flush",
+                              "--run-dir", str(folder.parent)], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return
+        if "debounce_seconds" in binding:
+            message = json.dumps(message if isinstance(message, list) else [message], ensure_ascii=True)
         argv = [argument.format(destination=binding["destination"], message=message)
                 for argument in binding["sender_argv"]]
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
@@ -260,6 +279,54 @@ def send(folder, binding, message, pending):
         pending.append((process, time.monotonic()))
     except (OSError, ValueError):
         diagnostic(folder, "sender launch failed")
+
+
+def flush_batch(run_dir):
+    folder = run_dir / STATE_DIR
+    binding = json.loads((folder / "state.json").read_text())["binding"]
+    with (folder / "batch-worker.lock").open("a+") as worker:
+        try:
+            fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        pending = []
+        try:
+            while True:
+                with (folder / "batch.lock").open("a+") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    batch = json.loads((folder / "batch.json").read_text())
+                    if not batch["messages"]:
+                        fcntl.flock(worker, fcntl.LOCK_UN)
+                        return
+                    if time.monotonic() >= batch["deadline"]:
+                        messages = batch["messages"]
+                        # Claim before sending: a failed attempt must not be replayed.
+                        save(folder, dict(messages=[]), "batch")
+                        # Release ownership under the queue lock so a new enqueue gets a worker.
+                        fcntl.flock(worker, fcntl.LOCK_UN)
+                        break
+                time.sleep(POLL_SECONDS)
+            for chunk in message_batches(messages):
+                send(folder, dict(binding, debounce_seconds=0), chunk, pending)
+                while pending:
+                    reap(folder, pending)
+                    if pending:
+                        time.sleep(POLL_SECONDS)
+        finally:
+            reap(folder, pending, cancel=True)
+
+
+def message_batches(messages):
+    batch, size = [], 2
+    for message in messages:
+        length = len(json.dumps(message, ensure_ascii=True)) + 2
+        if batch and size + length > MAX_BATCH_BYTES:
+            yield batch
+            batch, size = [], 2
+        batch.append(message)
+        size += length
+    if batch:
+        yield batch
 
 
 def reap(folder, pending, cancel=False):
@@ -412,7 +479,7 @@ else:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("launch", "watch", "stop", "deliver"))
+    parser.add_argument("command", choices=("launch", "watch", "stop", "deliver", "flush"))
     parser.add_argument("--run-dir", default=os.environ.get("BMAD_LOOP_RUN_DIR"))
     parser.add_argument("--stage", default="", help=argparse.SUPPRESS)
     parser.add_argument("--message", default="", help=argparse.SUPPRESS)
@@ -429,6 +496,8 @@ def main():
             watch(run_dir, args.lock_fd)
         elif args.command == "deliver":
             deliver(run_dir, args.stage, args.message)
+        elif args.command == "flush":
+            flush_batch(run_dir)
         else:
             folder = run_dir / STATE_DIR
             folder.mkdir(mode=0o700, exist_ok=True)
