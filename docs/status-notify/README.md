@@ -10,16 +10,15 @@ reads are required. Python 3.11+, POSIX file locks (macOS or Linux), and bmad-lo
 
 `journal_events` is available from version 1.1.0.
 
-The working source targets **2.0.0 (unreleased)**. It adds `debounce_seconds`
-and changes `{message}` to a JSON array of strings for all notifications, including
-when the window is zero. Update your sender to read that array before using 2.0.0.
-The installation commands below remain pinned to released 1.1.0.
+Version **2.0.0** adds `debounce_seconds` and changes `{message}` to a JSON array
+of strings for all notifications, including existing run bindings and when the
+window is zero. Update your sender to read that array before using 2.0.0.
 
-Install version 1.1.0 from the reviewed `status-notify-v1.1.0` tag, not from
+Install version 2.0.0 from the reviewed `status-notify-v2.0.0` tag, not from
 an uncommitted working tree:
 
 ```sh
-python3 -B manage.py install status-notify --version 1.1.0 --project /absolute/project
+python3 -B manage.py install status-notify --version 2.0.0 --project /absolute/project
 python3 -B manage.py status --project /absolute/project
 ```
 
@@ -41,6 +40,8 @@ destination = "existing-chat-uuid"
 hooks = "*"
 # Optional: defaults to all 22 supported journal notification kinds.
 journal_events = "*"
+# Optional: seconds of silence before sending a batch; 0 sends immediately.
+debounce_seconds = 0
 ```
 
 Alternatively, set the recipient in the shell that starts the run:
@@ -83,7 +84,7 @@ and both event selections in the run's `status-notify/state.json`. Later hooks a
 observer restarts use that saved binding. Use a new run to change the sender,
 recipient or selection. Existing run state is not migrated automatically.
 
-## Batch messages after a pause (2.0.0, unreleased)
+## Batch messages after a pause
 
 ```toml
 [plugins.status-notify]

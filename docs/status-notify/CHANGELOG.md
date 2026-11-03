@@ -1,6 +1,6 @@
 # Status Notify changelog
 
-## 2.0.0 — Unreleased
+## 2.0.0 — 2026-11-03
 
 - Add `debounce_seconds`: a nonnegative integer quiet window, with zero for
   immediate delivery. Each selected message resets a positive window. Journal
@@ -14,7 +14,8 @@
   JSON arrays to limit the size of command arguments.
 
 Compatibility: unchanged Python 3.11+, POSIX, bmad-loop 0.13.2 / API 1.
-Not released or installed; the reviewed 1.1.0 tag remains unchanged.
+Install from the immutable `status-notify-v2.0.0` tag. Review the changed sender
+contract and content before accepting the update; earlier tags remain unchanged.
 
 ## 1.1.0 — 2026-10-31
 
