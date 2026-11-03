@@ -48,12 +48,12 @@ class SenderTests(unittest.TestCase):
                         spawn.assert_not_called()
                     self.assertFalse((run / notify.STATE_DIR / "state.json").exists())
 
-    def test_zero_window_sends_json_array_and_legacy_keeps_string(self):
+    def test_immediate_delivery_always_sends_json_array(self):
         message = 'line one\n"quoted" {destination} Русский'
         binding = dict(destination="room", sender_argv=notify.sender_arguments("sender {destination} {message}"))
         with patch.object(notify.subprocess, "Popen") as spawn:
             notify.send(Path("/unused"), binding, message, [])
-            self.assertEqual(spawn.call_args.args[0][-1], message)
+            self.assertEqual(json.loads(spawn.call_args.args[0][-1]), [message])
             notify.send(Path("/unused"), dict(binding, debounce_seconds=0), message, [])
             self.assertEqual(json.loads(spawn.call_args.args[0][-1]), [message])
 
@@ -77,7 +77,7 @@ class SenderTests(unittest.TestCase):
         with patch.object(notify.subprocess, "Popen") as spawn:
             notify.send(Path("/unused"), binding, message, [])
         self.assertEqual(spawn.call_args.args[0], ["/path with spaces/sender",
-                         "--thread=" + destination, "--message", message, "{literal}"])
+                         "--thread=" + destination, "--message", json.dumps([message]), "{literal}"])
         self.assertFalse(spawn.call_args.kwargs.get("shell", False))
 
     def test_invalid_templates_are_rejected(self):
@@ -105,7 +105,7 @@ class SenderTests(unittest.TestCase):
             notify.send(folder, binding, message, pending)
             self.assertEqual(pending[0][0].wait(timeout=5), 0)
             notify.reap(folder, pending)
-            self.assertEqual(json.loads(output.read_text()), ["--recipient=" + destination, message])
+            self.assertEqual(json.loads(output.read_text()), ["--recipient=" + destination, json.dumps([message])])
             self.assertFalse(marker.exists())
 
     def test_missing_or_invalid_sender_leaves_no_binding_or_observer(self):
@@ -594,8 +594,10 @@ class ProcessTests(unittest.TestCase):
         messages = []
         for args in self.raw_messages():
             index = args.index("--message") + 1 if "--message" in args else 0
-            payload = args[index]
-            for message in json.loads(payload) if payload.startswith('["') else [payload]:
+            payload = json.loads(args[index])
+            self.assertIsInstance(payload, list)
+            self.assertTrue(all(isinstance(message, str) for message in payload))
+            for message in payload:
                 messages.append(args[:index] + [message] + args[index + 1:])
         return messages
 
@@ -611,6 +613,24 @@ class ProcessTests(unittest.TestCase):
         payload = json.loads(self.raw_messages()[0][-1])
         self.assertEqual(len(payload), 1)
         self.assertIn("Run completed", payload[0])
+
+    def test_saved_binding_without_window_sends_arrays_for_both_channels(self):
+        run = self.create_run("saved-array")
+        folder = run / notify.STATE_DIR
+        binding = sender_binding(run_id=run.name, thread_id="saved-recipient", codex_path=self.sender,
+                                 hooks=["pre_commit"])
+        notify.save(folder, notify.initial(binding))
+        self.append(run, "run-complete")
+        self.launch(run, thread="ignored-recipient")
+        worker = notify.handle_hook("pre_commit", SimpleNamespace(run_dir=str(run), run_id=run.name))
+        self.assertEqual(worker.wait(timeout=5), 0)
+        self.wait_for(lambda: len(self.raw_messages()) == 2)
+        messages = self.messages()
+        self.assertEqual(len(messages), 2)
+        self.assertTrue(all(args[2] == "saved-recipient" for args in messages))
+        self.assertEqual(sum("Run completed" in args[-1] for args in messages), 1)
+        self.assertEqual(sum("Hook pre_commit invoked" in args[-1] for args in messages), 1)
+        self.assertEqual(json.loads((folder / "state.json").read_text())["binding"], binding)
 
     def test_trailing_debounce_combines_journal_and_concurrent_hooks_after_completion(self):
         run = self.create_run("batch")

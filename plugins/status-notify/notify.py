@@ -270,8 +270,7 @@ def send(folder, binding, message, pending):
                               "--run-dir", str(folder.parent)], stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             return
-        if "debounce_seconds" in binding:
-            message = json.dumps(message if isinstance(message, list) else [message], ensure_ascii=True)
+        message = json.dumps(message if isinstance(message, list) else [message], ensure_ascii=True)
         argv = [argument.format(destination=binding["destination"], message=message)
                 for argument in binding["sender_argv"]]
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,

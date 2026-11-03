@@ -11,9 +11,8 @@ reads are required. Python 3.11+, POSIX file locks (macOS or Linux), and bmad-lo
 `journal_events` is available from version 1.1.0.
 
 The working source targets **2.0.0 (unreleased)**. It adds `debounce_seconds`
-and changes `{message}` to a JSON array of strings for new run bindings, including
+and changes `{message}` to a JSON array of strings for all notifications, including
 when the window is zero. Update your sender to read that array before using 2.0.0.
-Existing run bindings keep their original string format and immediate delivery.
 The installation commands below remain pinned to released 1.1.0.
 
 Install version 1.1.0 from the reviewed `status-notify-v1.1.0` tag, not from
@@ -114,9 +113,8 @@ Negative, fractional and nonnumeric settings are invalid and leave the new run
 inactive, with an advisory diagnostic.
 
 The SDK supplies `BMAD_LOOP_SETTING_DEBOUNCE_SECONDS`. The first saved binding
-freezes the window and array format. Settings changes need a new run; old
-bindings without the field continue to send plain strings without a delay.
-Do not edit saved bindings to change the format.
+freezes the window. Settings changes need a new run. The message format is always
+a JSON array of strings; a missing window uses the default of zero seconds.
 
 Batching uses a separate file and lock under the run's `status-notify/` directory.
 The file contains the same filtered message text sent to the recipient. Each
