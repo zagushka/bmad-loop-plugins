@@ -1,5 +1,22 @@
 # Status Notify changelog
 
+## 2.0.0 — 2026-11-03
+
+- Add `debounce_seconds`: a nonnegative integer quiet window, with zero for
+  immediate delivery. Each selected message resets a positive window. Journal
+  and hook messages share one batch per run, including after observer completion.
+- Pass a JSON array of strings through `{message}` for all notifications,
+  including immediate delivery and existing run bindings. This changes the sender
+  contract; plain-string delivery is no longer supported.
+- Freeze the window per run. Keep batch state separate from observer state and
+  claim batches before each single sender attempt. No retry or receipt guarantee.
+- Keep one waiting batch worker per run and split large buffers into successive
+  JSON arrays to limit the size of command arguments.
+
+Compatibility: unchanged Python 3.11+, POSIX, bmad-loop 0.13.2 / API 1.
+Install from the immutable `status-notify-v2.0.0` tag. Review the changed sender
+contract and content before accepting the update; earlier tags remain unchanged.
+
 ## 1.1.0 — 2026-10-31
 
 - Add independent `journal_events` selection: `*` (default), comma-separated

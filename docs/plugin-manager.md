@@ -37,7 +37,7 @@ python3 -B manage.py status --project /absolute/project
 Install Status Notify independently, or alongside delivery:
 
 ```sh
-python3 -B manage.py install status-notify --version 1.0.0 --project /absolute/project
+python3 -B manage.py install status-notify --version 2.0.0 --project /absolute/project
 ```
 
 Each plugin has its own release tag and lock entry. Updating one preserves the

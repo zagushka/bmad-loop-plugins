@@ -10,11 +10,15 @@ reads are required. Python 3.11+, POSIX file locks (macOS or Linux), and bmad-lo
 
 `journal_events` is available from version 1.1.0.
 
-Install version 1.1.0 from the reviewed `status-notify-v1.1.0` tag, not from
+Version **2.0.0** adds `debounce_seconds` and changes `{message}` to a JSON array
+of strings for all notifications, including existing run bindings and when the
+window is zero. Update your sender to read that array before using 2.0.0.
+
+Install version 2.0.0 from the reviewed `status-notify-v2.0.0` tag, not from
 an uncommitted working tree:
 
 ```sh
-python3 -B manage.py install status-notify --version 1.1.0 --project /absolute/project
+python3 -B manage.py install status-notify --version 2.0.0 --project /absolute/project
 python3 -B manage.py status --project /absolute/project
 ```
 
@@ -36,6 +40,8 @@ destination = "existing-chat-uuid"
 hooks = "*"
 # Optional: defaults to all 22 supported journal notification kinds.
 journal_events = "*"
+# Optional: seconds of silence before sending a batch; 0 sends immediately.
+debounce_seconds = 0
 ```
 
 Alternatively, set the recipient in the shell that starts the run:
@@ -77,6 +83,49 @@ The first successful binding save freezes the parsed sender arguments, destinati
 and both event selections in the run's `status-notify/state.json`. Later hooks and
 observer restarts use that saved binding. Use a new run to change the sender,
 recipient or selection. Existing run state is not migrated automatically.
+
+## Batch messages after a pause
+
+```toml
+[plugins.status-notify]
+# Keep your sender_command, destination and event selections.
+debounce_seconds = 10
+```
+
+`debounce_seconds` is a nonnegative integer in seconds. The default, `0`, sends
+each notification immediately. A positive value collects selected journal and
+hook messages for the same run. Each new selected message starts the window
+again. After a pause of at least that length, the sender receives the collected
+messages through `{message}`, as a JSON array of strings. For example:
+
+```json
+["first notification", "second notification"]
+```
+
+An immediate notification also uses an array with one item. Empty arrays are
+never sent. Large buffers are split into successive arrays of up to 32 KiB of
+encoded message data to stay below command argument limits. Individual messages
+are kept intact; an unusually large single message or environment can still
+exceed the operating system's limit and fail that delivery attempt.
+Unselected events do not reset the window. Different runs have
+separate buffers, even when they use the same destination. Polling and process
+scheduling can add a delay. Continuous messages can postpone delivery indefinitely.
+Negative, fractional and nonnumeric settings are invalid and leave the new run
+inactive, with an advisory diagnostic.
+
+The SDK supplies `BMAD_LOOP_SETTING_DEBOUNCE_SECONDS`. The first saved binding
+freezes the window. Settings changes need a new run. The message format is always
+a JSON array of strings; a missing window uses the default of zero seconds.
+
+Batching uses a separate file and lock under the run's `status-notify/` directory.
+The file contains the same filtered message text sent to the recipient. Each
+enqueue starts a detached worker candidate; only one worker waits per run. A batch can be delivered after the
+journal observer exits on completion or stops. Workers share the deadline and
+claim each batch once before its sender attempt; the sender's 15-second timeout
+starts after the quiet window. No sender is retried. A worker or launch failure
+can leave buffered messages until another message starts a worker; there is no
+automatic recovery or receipt guarantee. A system restart does not restart batch
+workers. The stop marker controls only journal observation, not batch workers.
 
 The binding is saved before the observer is launched. If observer launch fails,
 the saved binding remains; a later launch uses it even if settings changed.
@@ -263,21 +312,24 @@ assignments, bearer tokens, common API key formats, JWTs and URLs are redacted
 before the reason is sent. Prompt, transcript and environment fields and full
 records are never copied. Free-text redaction cannot identify every arbitrary
 secret; inspect the target journal if your integrations put unusual credentials
-in reasons. Local state holds only the binding, reducer state and cursor;
+in reasons. Local state holds the binding, reducer state, cursor and buffered messages;
 diagnostics omit event text.
 
-Each selected journal notification has one delivery attempt. The observer saves
+With immediate delivery, each selected journal notification has one delivery attempt. The observer saves
 and syncs its cursor and mapping state **before** it launches the sender. A crash
 between those steps can lose a message. Failed delivery is never retried. Successful
 sender exit does not prove that the destination chat read or acted on the
 message. Delivery order can differ from journal order because senders run
-independently. Hook messages also have one attempt per invocation, with no
+independently. With immediate delivery, hook messages also have one attempt per invocation, with no
 persistent queue, retry or replay. A callback/process crash can lose one. Each
 hook invocation starts a short-lived delivery process, even when its saved
 selection is empty. Selected invocations can start concurrent senders; there is
 no global concurrency limit. The all-hooks default can produce many messages.
 The detached delivery process uses the saved binding and the same sender timeout
 and diagnostics as the observer.
+
+With a positive `debounce_seconds` window, both channels use the persistent batch
+and detached workers described above instead of separate immediate sender attempts.
 
 The sender uses the parsed argument list, null standard streams and a new
 process session. The observer or detached delivery process polls it without a
@@ -308,7 +360,7 @@ python3 -B /absolute/project/.bmad-loop/plugins/status-notify/notify.py stop --r
 ```
 
 Stop writes a marker for journal observation only. It does not stop the run,
-future hook callbacks or already launched hook senders. A later pre_run can
+future hook callbacks, batch workers or already launched hook senders. A later pre_run can
 restart observation from the saved cursor. Persistent plugin files (state,
 lock, PID, stop marker and diagnostics) stay in the run's `status-notify/`
 directory. The PID is informational; stopping uses the marker.

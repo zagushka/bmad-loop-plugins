@@ -1,6 +1,6 @@
 [plugin]
 name = "status-notify"
-version = "1.1.0"
+version = "2.0.0"
 api_version = 1
 description = "Advisory run and story status notifications through an explicit sender command"
 
@@ -25,6 +25,12 @@ key = "journal_events"
 type = "str"
 default = "*"
 help = "Journal notifications for new runs: * for all, comma-separated exact event kinds, or empty for none"
+
+[[settings]]
+key = "debounce_seconds"
+type = "int"
+default = 0
+help = "Quiet window in seconds for new runs; 0 sends immediately, positive values batch messages after silence"
 
 [[settings]]
 key = "destination"
